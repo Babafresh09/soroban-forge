@@ -12,8 +12,14 @@
 //! `soroban-forge-core::toolchain` helpers that `doctor` uses.  This turns a
 //! cryptic "unknown subcommand: contract" into a clear error pointing at
 //! `soroban-forge doctor`.
+//!
+//! `--all` optimizes every contract crate of a Cargo workspace in one run
+//! (issue #412), and `--compare-to` diffs a run against a report previously
+//! saved with `optimize --json` (issue #418).
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
 
 use clap::{Arg, ArgMatches, Command};
 use serde::{Deserialize, Serialize};
@@ -241,21 +247,95 @@ fn path_str(path: &Path) -> Result<&str> {
         .ok_or_else(|| ForgeError::Other(format!("path {} is not valid UTF-8", path.display())))
 }
 
-/// Run `stellar contract optimize --wasm <wasm_path>`, streaming its output
-/// directly to the terminal. Never reimplemented locally.
+/// Run `command` with piped stdout/stderr, echoing both live to this
+/// process's terminal while also capturing them, so `--verbose` users still
+/// see progress as it happens and the captured stderr can go into an error.
 ///
-/// Thin system-touching wrapper; not unit-tested.
-fn run_stellar_optimize(wasm_path: &Path) -> Result<()> {
+/// Deliberately duplicated from `deploy` rather than shared: modules depend
+/// only on `soroban-forge-core`, never on each other.
+fn stream_command(command: &mut std::process::Command) -> std::io::Result<Output> {
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = stdout.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            std::io::stdout().write_all(&chunk[..count])?;
+            std::io::stdout().flush()?;
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = stderr.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            std::io::stderr().write_all(&chunk[..count])?;
+            std::io::stderr().flush()?;
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let status = child.wait()?;
+    let stdout = stdout_reader.join().expect("stdout reader did not panic")?;
+    let stderr = stderr_reader.join().expect("stderr reader did not panic")?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Error message for a failed `stellar contract optimize`, carrying the CLI's
+/// own stderr so the reason survives log capture that never saw the live
+/// terminal (issue #417).  Matches the `"<cmd> failed:\n<stderr>"` shape
+/// `verify`, `deploy` and `spec` use.
+pub fn optimize_failure_message(status: &str, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("stellar contract optimize failed ({status})")
+    } else {
+        format!("stellar contract optimize failed ({status}):\n{stderr}")
+    }
+}
+
+/// Run `stellar contract optimize --wasm <wasm_path>`. Never reimplemented
+/// locally.
+///
+/// Output is always captured so a failure can report the CLI's stderr; with
+/// `verbose` it is additionally streamed live as it is produced.
+///
+/// Thin system-touching wrapper; the failure formatting lives in
+/// [`optimize_failure_message`], which is unit-tested, and the whole path is
+/// covered end-to-end by `tests/optimize.rs` with a stub `stellar`.
+fn run_stellar_optimize(wasm_path: &Path, verbose: bool) -> Result<()> {
     let wasm_str = path_str(wasm_path)?;
 
     let mut cmd = std::process::Command::new("stellar");
     cmd.args(["contract", "optimize", "--wasm", wasm_str]);
     log::debug!("optimizing {wasm_str}");
 
-    match cmd.status() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(ForgeError::Other(format!(
-            "stellar contract optimize failed (exit {status})"
+    let result = if verbose {
+        stream_command(&mut cmd)
+    } else {
+        cmd.output()
+    };
+
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(ForgeError::Other(optimize_failure_message(
+            &out.status.to_string(),
+            &out.stderr,
         ))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(ForgeError::ToolMissing("stellar-cli".into()))
@@ -281,9 +361,45 @@ pub enum OptimizeStatus {
     AlreadyMinimal,
 }
 
+/// How this run's optimized size compares to a saved baseline report
+/// (`optimize --compare-to`, issue #418).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Comparison {
+    /// Path of the baseline report, as given on the command line.
+    pub baseline: String,
+    /// `after_bytes` recorded in the baseline report.
+    pub baseline_after_bytes: u64,
+    /// This run's `after_bytes` minus the baseline's: negative means the
+    /// optimized wasm shrank since the baseline, positive means it grew.
+    pub delta_bytes: i64,
+}
+
+impl Comparison {
+    pub fn new(baseline: &str, baseline_after_bytes: u64, current_after_bytes: u64) -> Self {
+        Self {
+            baseline: baseline.to_string(),
+            baseline_after_bytes,
+            delta_bytes: current_after_bytes as i64 - baseline_after_bytes as i64,
+        }
+    }
+
+    /// Size change relative to the baseline, in percent (`0.0` when the
+    /// baseline was empty).
+    pub fn delta_percent(&self) -> f64 {
+        if self.baseline_after_bytes == 0 {
+            0.0
+        } else {
+            (self.delta_bytes as f64 / self.baseline_after_bytes as f64) * 100.0
+        }
+    }
+}
+
 /// The outcome of one optimize run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OptimizeReport {
+    /// Crate name, set for `--all` runs so each array entry is identifiable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<String>,
     pub wasm: String,
     pub optimized_wasm: String,
     pub before_bytes: u64,
@@ -293,6 +409,9 @@ pub struct OptimizeReport {
     /// Whether any bytes were saved, derived from `saved_bytes` at
     /// construction so it can never disagree with it.
     pub status: OptimizeStatus,
+    /// Delta against `--compare-to`, when given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<Comparison>,
 }
 
 impl OptimizeReport {
@@ -304,13 +423,27 @@ impl OptimizeReport {
             OptimizeStatus::AlreadyMinimal
         };
         Self {
+            contract: None,
             wasm: wasm.display().to_string(),
             optimized_wasm: optimized_wasm.display().to_string(),
             before_bytes,
             after_bytes,
             saved_bytes,
             status,
+            comparison: None,
         }
+    }
+
+    /// Tag the report with the contract it belongs to (`--all`).
+    pub fn with_contract(mut self, contract: &str) -> Self {
+        self.contract = Some(contract.to_string());
+        self
+    }
+
+    /// Attach a comparison against a baseline report's `after_bytes`.
+    pub fn compared_to(mut self, baseline: &str, baseline_after_bytes: u64) -> Self {
+        self.comparison = Some(Comparison::new(baseline, baseline_after_bytes, self.after_bytes));
+        self
     }
 
     /// Percentage reduction from `before_bytes` to `after_bytes`, `0.0` when
@@ -335,11 +468,16 @@ impl OptimizeReport {
 /// "clean up the pre-optimization wasm" requirement: after a successful
 /// in-place run, only the original filename remains on disk.
 pub fn optimize(wasm_path: &Path, in_place: bool) -> Result<OptimizeReport> {
+    optimize_with(wasm_path, in_place, false)
+}
+
+/// [`optimize`], additionally streaming the CLI's output live when `verbose`.
+pub fn optimize_with(wasm_path: &Path, in_place: bool, verbose: bool) -> Result<OptimizeReport> {
     let before_bytes = std::fs::metadata(wasm_path)
         .map_err(ForgeError::io(format!("reading {}", wasm_path.display())))?
         .len();
 
-    run_stellar_optimize(wasm_path)?;
+    run_stellar_optimize(wasm_path, verbose)?;
 
     let optimized_path = optimized_wasm_path(wasm_path);
     let after_bytes = std::fs::metadata(&optimized_path)
@@ -374,6 +512,14 @@ pub fn optimize(wasm_path: &Path, in_place: bool) -> Result<OptimizeReport> {
 /// prints before/after/saved, while an already-minimal run collapses to a
 /// single `size` line and never prints a misleading "saved 0 bytes".
 pub fn format_report(report: &OptimizeReport) -> String {
+    let mut out = format_size_lines(report);
+    if let Some(comparison) = &report.comparison {
+        out.push_str(&format_comparison(comparison));
+    }
+    out
+}
+
+fn format_size_lines(report: &OptimizeReport) -> String {
     match report.status {
         OptimizeStatus::Optimized => format!(
             "optimized {} -> {}\n\n  before  {} bytes\n  after   {} bytes\n  saved   {} bytes ({:.1}%)\n",
@@ -391,20 +537,322 @@ pub fn format_report(report: &OptimizeReport) -> String {
     }
 }
 
-/// The same report as JSON, for `--json`.
+/// The `vs baseline` line appended under `--compare-to`.
+pub fn format_comparison(comparison: &Comparison) -> String {
+    let trend = match comparison.delta_bytes {
+        d if d < 0 => "smaller",
+        d if d > 0 => "larger",
+        _ => "unchanged",
+    };
+    format!(
+        "  vs baseline {} bytes: {:+} bytes ({:+.1}%, {trend}) [{}]\n",
+        comparison.baseline_after_bytes,
+        comparison.delta_bytes,
+        comparison.delta_percent(),
+        comparison.baseline,
+    )
+}
+
+/// The report as a JSON value.
 ///
 /// `status` is serialized by the `Serialize` derive as one of
-/// `"optimized"` / `"already-minimal"`.  `percent_saved` is injected here
-/// because it is a computed convenience, not a stored field.
-pub fn json_report(report: &OptimizeReport) -> String {
+/// `"optimized"` / `"already-minimal"`.  `percent_saved` (and
+/// `comparison.delta_percent`) are injected here because they are computed
+/// conveniences, not stored fields.
+pub fn json_value(report: &OptimizeReport) -> serde_json::Value {
     let mut value = match serde_json::to_value(report) {
         Ok(value) => value,
-        Err(e) => return format!("{{\"error\":\"{e}\"}}"),
+        Err(e) => return serde_json::json!({ "error": e.to_string() }),
     };
     if let Some(object) = value.as_object_mut() {
         object.insert("percent_saved".into(), serde_json::json!(report.percent_saved()));
+        if let (Some(comparison), Some(serde_json::Value::Object(c))) =
+            (&report.comparison, object.get_mut("comparison"))
+        {
+            c.insert(
+                "delta_percent".into(),
+                serde_json::json!(comparison.delta_percent()),
+            );
+        }
     }
-    serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+    value
+}
+
+/// The same report as JSON, for `--json`.
+pub fn json_report(report: &OptimizeReport) -> String {
+    serde_json::to_string_pretty(&json_value(report))
+        .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+}
+
+// ---- --compare-to baselines (issue #418) ----
+
+/// The subset of a saved `optimize --json` report needed to compare against.
+/// Unknown fields are ignored, so reports from older or newer versions load.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BaselineEntry {
+    #[serde(default)]
+    pub contract: Option<String>,
+    #[serde(default)]
+    pub wasm: Option<String>,
+    pub after_bytes: u64,
+}
+
+/// Parse a saved report: either a single object (`optimize --json`) or an
+/// array (`optimize --all --json`).  Array entries without `after_bytes` —
+/// i.e. contracts that failed in that run — are skipped.
+pub fn parse_baseline(raw: &str) -> std::result::Result<Vec<BaselineEntry>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("not valid JSON: {e}"))?;
+    match value {
+        serde_json::Value::Array(items) => {
+            let entries: Vec<BaselineEntry> = items
+                .into_iter()
+                .filter_map(|item| serde_json::from_value(item).ok())
+                .collect();
+            if entries.is_empty() {
+                Err("contains no report with an `after_bytes` field".into())
+            } else {
+                Ok(entries)
+            }
+        }
+        serde_json::Value::Object(_) => serde_json::from_value(value)
+            .map(|entry| vec![entry])
+            .map_err(|e| {
+                format!("is not an `optimize --json` report ({e}) — save one with `optimize --json > report.json`")
+            }),
+        _ => Err("is not an `optimize --json` report (expected an object or array)".into()),
+    }
+}
+
+/// Read and parse a baseline report from disk.
+pub fn load_baseline(path: &Path) -> Result<Vec<BaselineEntry>> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(ForgeError::io(format!("reading baseline {}", path.display())))?;
+    parse_baseline(&raw).map_err(|message| ForgeError::Config {
+        path: path.to_path_buf(),
+        message,
+    })
+}
+
+fn wasm_file_name(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
+/// Pick the baseline entry matching `report`: by contract name, then by
+/// wasm file name, then — for a single-entry baseline — that entry.
+pub fn select_baseline<'a>(
+    entries: &'a [BaselineEntry],
+    report: &OptimizeReport,
+) -> Option<&'a BaselineEntry> {
+    if let Some(contract) = report.contract.as_deref() {
+        if let Some(entry) = entries
+            .iter()
+            .find(|e| e.contract.as_deref() == Some(contract))
+        {
+            return Some(entry);
+        }
+    }
+    let name = wasm_file_name(&report.wasm);
+    if name.is_some() {
+        if let Some(entry) = entries
+            .iter()
+            .find(|e| e.wasm.as_deref().and_then(wasm_file_name) == name)
+        {
+            return Some(entry);
+        }
+    }
+    if entries.len() == 1 {
+        return entries.first();
+    }
+    None
+}
+
+// ---- --all workspace discovery (issue #412) ----
+
+/// A contract crate found in a workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceContract {
+    /// snake_case crate name, which the wasm is named after.
+    pub crate_name: String,
+    /// Directory holding the member's `Cargo.toml`.
+    pub dir: PathBuf,
+}
+
+fn read_manifest_table(dir: &Path) -> Result<toml::Table> {
+    let manifest_path = dir.join("Cargo.toml");
+    let raw = std::fs::read_to_string(&manifest_path).map_err(ForgeError::io(format!(
+        "reading {}",
+        manifest_path.display()
+    )))?;
+    raw.parse::<toml::Table>().map_err(|e| ForgeError::Config {
+        path: manifest_path.clone(),
+        message: e.to_string(),
+    })
+}
+
+/// Whether a manifest describes a Soroban contract: it builds a `cdylib`
+/// (what `stellar contract build` emits a wasm for) or depends on
+/// `soroban-sdk`.  Helper crates in the same workspace are skipped.
+pub fn is_contract_manifest(table: &toml::Table) -> bool {
+    let cdylib = table
+        .get("lib")
+        .and_then(|lib| lib.get("crate-type"))
+        .and_then(|types| types.as_array())
+        .is_some_and(|types| types.iter().any(|t| t.as_str() == Some("cdylib")));
+    let soroban_dep = table
+        .get("dependencies")
+        .and_then(|deps| deps.as_table())
+        .is_some_and(|deps| deps.contains_key("soroban-sdk"));
+    table.contains_key("package") && (cdylib || soroban_dep)
+}
+
+/// Member directories of the workspace at `root`, from `[workspace].members`
+/// with trailing `/*` globs expanded.  Only directories with a `Cargo.toml`
+/// are returned, sorted for a stable report order.
+///
+/// Deliberately duplicated from `testgen` rather than shared: modules depend
+/// only on `soroban-forge-core`, never on each other.
+pub fn workspace_members(root: &Path, table: &toml::Table) -> Vec<PathBuf> {
+    let patterns: Vec<String> = table
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut dirs = Vec::new();
+    for pattern in patterns {
+        if let Some(prefix) = pattern.strip_suffix("/*") {
+            if let Ok(entries) = std::fs::read_dir(root.join(prefix)) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.join("Cargo.toml").is_file() {
+                        dirs.push(path);
+                    }
+                }
+            }
+        } else {
+            let path = root.join(&pattern);
+            if path.join("Cargo.toml").is_file() {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Every contract crate under `root`.  A plain (non-workspace) contract
+/// project counts as a workspace of one, so `--all` also works there.
+pub fn discover_contracts(root: &Path) -> Result<Vec<WorkspaceContract>> {
+    if !root.join("Cargo.toml").is_file() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "{} is not a cargo project (no Cargo.toml) — run --all from the workspace root or pass --path",
+            root.display()
+        )));
+    }
+    let root_table = read_manifest_table(root)?;
+
+    let mut dirs = workspace_members(root, &root_table);
+    if root_table.contains_key("package") && !dirs.iter().any(|d| d == root) {
+        dirs.insert(0, root.to_path_buf());
+    }
+
+    let mut contracts = Vec::new();
+    for dir in dirs {
+        let table = if dir == root {
+            root_table.clone()
+        } else {
+            match read_manifest_table(&dir) {
+                Ok(table) => table,
+                Err(e) => {
+                    log::warn!("skipping {}: {e}", dir.display());
+                    continue;
+                }
+            }
+        };
+        if !is_contract_manifest(&table) {
+            continue;
+        }
+        let Some(name) = table
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+        else {
+            continue;
+        };
+        contracts.push(WorkspaceContract {
+            crate_name: name.replace('-', "_"),
+            dir,
+        });
+    }
+    Ok(contracts)
+}
+
+/// Where a workspace member's release wasm lives: the workspace's shared
+/// `target/` first (cargo's default), then the member's own `target/`.
+pub fn contract_wasm(root: &Path, contract: &WorkspaceContract) -> Option<PathBuf> {
+    [root, contract.dir.as_path()]
+        .into_iter()
+        .map(|dir| locate_wasm(dir, &contract.crate_name))
+        .find(|path| path.is_file())
+}
+
+/// One contract's outcome in an `--all` run.
+#[derive(Debug)]
+pub struct ContractOutcome {
+    pub contract: String,
+    pub result: std::result::Result<OptimizeReport, String>,
+}
+
+/// Human output for `--all`: one block per contract.
+pub fn format_all(outcomes: &[ContractOutcome]) -> String {
+    let mut out = String::new();
+    for (i, outcome) in outcomes.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match &outcome.result {
+            Ok(report) => {
+                out.push_str(&format!("[{}] ", outcome.contract));
+                out.push_str(&format_report(report));
+            }
+            Err(message) => {
+                out.push_str(&format!("[{}] failed: {message}\n", outcome.contract));
+            }
+        }
+    }
+    let failed = outcomes.iter().filter(|o| o.result.is_err()).count();
+    out.push_str(&format!(
+        "\n{} contract(s): {} optimized, {} failed\n",
+        outcomes.len(),
+        outcomes.len() - failed,
+        failed
+    ));
+    out
+}
+
+/// JSON output for `--all`: an array with one report per contract.  A failed
+/// contract is an object carrying `contract` and `error` instead.
+pub fn json_all(outcomes: &[ContractOutcome]) -> String {
+    let values: Vec<serde_json::Value> = outcomes
+        .iter()
+        .map(|outcome| match &outcome.result {
+            Ok(report) => json_value(report),
+            Err(message) => serde_json::json!({
+                "contract": outcome.contract,
+                "error": message,
+            }),
+        })
+        .collect();
+    serde_json::to_string_pretty(&values).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
 }
 
 /// Select the report output, or suppress it entirely in quiet mode.
@@ -475,6 +923,19 @@ impl ForgePlugin for OptimizePlugin {
                     .value_parser(clap::value_parser!(u64))
                     .help("Maximum allowed size in bytes after optimization"),
             )
+            .arg(
+                Arg::new("all")
+                    .long("all")
+                    .help("Optimize every contract crate in the workspace at --path (or the current directory), reporting one result per contract; with --json, prints an array")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("wasm"),
+            )
+            .arg(
+                Arg::new("compare-to")
+                    .long("compare-to")
+                    .value_name("REPORT")
+                    .help("Compare the optimized size against a report saved earlier with `optimize --json > report.json` and print the delta"),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -489,9 +950,15 @@ impl ForgePlugin for OptimizePlugin {
             .unwrap_or_else(|| ctx.cwd.clone());
         let wasm_override = matches.get_one::<String>("wasm").map(|p| ctx.cwd.join(p));
 
-        let wasm_path = resolve_local_wasm(&dir, wasm_override.as_deref())?;
-
         let in_place = matches.get_flag("in-place");
+        let verbose = ctx.verbose > 0;
+
+        // Load the baseline up front so a bad --compare-to path fails before
+        // any wasm is rewritten.
+        let baseline_arg = matches.get_one::<String>("compare-to");
+        let baseline = baseline_arg
+            .map(|p| load_baseline(&ctx.cwd.join(p)))
+            .transpose()?;
 
         let check = matches.get_flag("check");
         let max_size = if check {
@@ -511,7 +978,30 @@ impl ForgePlugin for OptimizePlugin {
             None
         };
 
-        let report = optimize(&wasm_path, in_place)?;
+        if matches.get_flag("all") {
+            return run_all(
+                &dir,
+                AllOptions {
+                    in_place,
+                    verbose,
+                    max_size,
+                    baseline: baseline_arg.zip(baseline.as_deref()),
+                },
+                ctx,
+            );
+        }
+
+        let wasm_path = resolve_local_wasm(&dir, wasm_override.as_deref())?;
+        let mut report = optimize_with(&wasm_path, in_place, verbose)?;
+        if let (Some(label), Some(entries)) = (baseline_arg, baseline.as_deref()) {
+            let entry = select_baseline(entries, &report).ok_or_else(|| {
+                ForgeError::InvalidArgument(format!(
+                    "baseline {label} has no entry for {} — compare against a report from the same contract",
+                    report.wasm
+                ))
+            })?;
+            report = report.compared_to(label, entry.after_bytes);
+        }
         check_budget(&report, max_size)?;
 
         if let Some(output) = report_output(&report, ctx.json, ctx.quiet) {
@@ -522,6 +1012,88 @@ impl ForgePlugin for OptimizePlugin {
         }
 
         Ok(())
+    }
+}
+
+/// Settings shared by every contract in an `--all` run.
+struct AllOptions<'a> {
+    in_place: bool,
+    verbose: bool,
+    max_size: Option<u64>,
+    /// `(label, entries)` from `--compare-to`.
+    baseline: Option<(&'a String, &'a [BaselineEntry])>,
+}
+
+/// Optimize one workspace contract, applying the comparison and budget.
+fn optimize_contract(
+    root: &Path,
+    contract: &WorkspaceContract,
+    options: &AllOptions<'_>,
+) -> std::result::Result<OptimizeReport, String> {
+    let wasm = contract_wasm(root, contract).ok_or_else(|| {
+        format!(
+            "no release build found at {} — run `stellar contract build` first",
+            locate_wasm(root, &contract.crate_name).display()
+        )
+    })?;
+    let mut report = optimize_with(&wasm, options.in_place, options.verbose)
+        .map_err(|e| e.to_string())?
+        .with_contract(&contract.crate_name);
+    if let Some((label, entries)) = options.baseline {
+        if let Some(entry) = select_baseline(entries, &report) {
+            report = report.compared_to(label, entry.after_bytes);
+        }
+    }
+    check_budget(&report, options.max_size).map_err(|e| e.to_string())?;
+    Ok(report)
+}
+
+/// `optimize --all`: optimize every contract crate in the workspace at
+/// `root`, print one result per contract (an array under `--json`), and fail
+/// at the end if any contract failed — after every contract has been tried.
+fn run_all(root: &Path, options: AllOptions<'_>, ctx: &ForgeContext) -> Result<()> {
+    let contracts = discover_contracts(root)?;
+    if contracts.is_empty() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "no contract crates found in {} — --all looks for workspace members that build a cdylib or depend on soroban-sdk",
+            root.display()
+        )));
+    }
+
+    let outcomes: Vec<ContractOutcome> = contracts
+        .iter()
+        .map(|contract| ContractOutcome {
+            contract: contract.crate_name.clone(),
+            result: optimize_contract(root, contract, &options),
+        })
+        .collect();
+
+    if !ctx.quiet {
+        let output = if ctx.json {
+            json_all(&outcomes)
+        } else {
+            format_all(&outcomes)
+        };
+        print!("{output}");
+        if !output.ends_with('\n') {
+            println!();
+        }
+    }
+
+    let failed: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| o.result.is_err())
+        .map(|o| o.contract.as_str())
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(ForgeError::Other(format!(
+            "optimize --all: {} of {} contract(s) failed: {}",
+            failed.len(),
+            outcomes.len(),
+            failed.join(", ")
+        )))
     }
 }
 
@@ -1009,5 +1581,284 @@ mod tests {
         let err = check_stellar_cli(Some("garbage")).unwrap_err();
         let rendered = err.to_string();
         assert!(rendered.contains("too old"), "{rendered}");
+    }
+
+    // ---- CLI stderr in failure messages (issue #417) ----
+
+    #[test]
+    fn failure_message_includes_cli_stderr() {
+        let message = optimize_failure_message(
+            "exit status: 1",
+            b"error: failed to parse wasm: unexpected end-of-file\n",
+        );
+        assert!(message.contains("stellar contract optimize failed"), "{message}");
+        assert!(message.contains("exit status: 1"), "{message}");
+        assert!(
+            message.contains("failed to parse wasm: unexpected end-of-file"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn failure_message_without_stderr_still_reports_status() {
+        let message = optimize_failure_message("exit status: 2", b"  \n");
+        assert_eq!(message, "stellar contract optimize failed (exit status: 2)");
+    }
+
+    // ---- --compare-to (issue #418) ----
+
+    fn report(before: u64, after: u64) -> OptimizeReport {
+        OptimizeReport::new(
+            Path::new("target/wasm32v1-none/release/token.wasm"),
+            Path::new("target/wasm32v1-none/release/token.optimized.wasm"),
+            before,
+            after,
+        )
+    }
+
+    #[test]
+    fn comparing_two_reports_computes_the_delta() {
+        // Baseline saved from an earlier `optimize --json > report.json` run.
+        let saved = json_report(&report(1000, 750));
+        let baseline = parse_baseline(&saved).unwrap();
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(baseline[0].after_bytes, 750);
+
+        let current = report(1000, 700);
+        let entry = select_baseline(&baseline, &current).unwrap();
+        let compared = current.compared_to("report.json", entry.after_bytes);
+        let comparison = compared.comparison.as_ref().unwrap();
+
+        assert_eq!(comparison.baseline_after_bytes, 750);
+        assert_eq!(comparison.delta_bytes, -50);
+        assert!((comparison.delta_percent() - (-50.0 / 750.0 * 100.0)).abs() < 1e-9);
+
+        let text = format_report(&compared);
+        assert!(text.contains("vs baseline 750 bytes: -50 bytes (-6.7%, smaller)"), "{text}");
+        assert!(text.contains("report.json"), "{text}");
+
+        let json: serde_json::Value = serde_json::from_str(&json_report(&compared)).unwrap();
+        assert_eq!(json["comparison"]["baseline_after_bytes"], 750);
+        assert_eq!(json["comparison"]["delta_bytes"], -50);
+        let percent = json["comparison"]["delta_percent"].as_f64().unwrap();
+        assert!((percent - (-6.666_666)).abs() < 1e-3, "{percent}");
+    }
+
+    #[test]
+    fn comparison_reports_growth_and_no_change() {
+        let grew = report(1000, 800).compared_to("old.json", 750);
+        let c = grew.comparison.as_ref().unwrap();
+        assert_eq!(c.delta_bytes, 50);
+        assert!(format_comparison(c).contains("+50 bytes (+6.7%, larger)"));
+
+        let same = report(1000, 750).compared_to("old.json", 750);
+        let c = same.comparison.as_ref().unwrap();
+        assert_eq!(c.delta_bytes, 0);
+        assert!(format_comparison(c).contains("unchanged"));
+
+        let empty = Comparison::new("old.json", 0, 10);
+        assert_eq!(empty.delta_percent(), 0.0);
+    }
+
+    #[test]
+    fn comparison_is_shown_for_already_minimal_runs_too() {
+        let text = format_report(&report(750, 750).compared_to("old.json", 800));
+        assert!(text.contains("already minimal"), "{text}");
+        assert!(text.contains("-50 bytes"), "{text}");
+    }
+
+    #[test]
+    fn reports_without_comparison_omit_the_field() {
+        let json: serde_json::Value = serde_json::from_str(&json_report(&report(1000, 750))).unwrap();
+        assert!(json.get("comparison").is_none(), "{json}");
+        assert!(json.get("contract").is_none(), "{json}");
+    }
+
+    #[test]
+    fn parse_baseline_accepts_all_arrays_and_skips_failed_entries() {
+        let raw = r#"[
+            {"contract": "token", "wasm": "target/wasm32v1-none/release/token.wasm", "after_bytes": 700},
+            {"contract": "pool", "error": "no release build found"},
+            {"contract": "amm", "wasm": "target/wasm32v1-none/release/amm.wasm", "after_bytes": 1200}
+        ]"#;
+        let entries = parse_baseline(raw).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].contract.as_deref(), Some("amm"));
+    }
+
+    #[test]
+    fn parse_baseline_rejects_non_reports() {
+        assert!(parse_baseline("not json").unwrap_err().contains("not valid JSON"));
+        assert!(parse_baseline(r#"{"size": 3}"#)
+            .unwrap_err()
+            .contains("optimize --json"));
+        assert!(parse_baseline("[]").is_err());
+        assert!(parse_baseline("42").is_err());
+    }
+
+    #[test]
+    fn load_baseline_reports_the_path_on_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("report.json");
+        std::fs::write(&path, "{").unwrap();
+        let err = load_baseline(&path).unwrap_err().to_string();
+        assert!(err.contains("report.json"), "{err}");
+
+        let missing = load_baseline(&tmp.path().join("nope.json")).unwrap_err().to_string();
+        assert!(missing.contains("nope.json"), "{missing}");
+    }
+
+    #[test]
+    fn select_baseline_matches_by_contract_then_wasm_name() {
+        let entries = vec![
+            BaselineEntry {
+                contract: Some("token".into()),
+                wasm: Some("/old/checkout/target/wasm32v1-none/release/token.wasm".into()),
+                after_bytes: 700,
+            },
+            BaselineEntry {
+                contract: Some("amm".into()),
+                wasm: Some("/old/checkout/target/wasm32v1-none/release/amm.wasm".into()),
+                after_bytes: 1200,
+            },
+        ];
+
+        let by_contract = report(1000, 650).with_contract("amm");
+        assert_eq!(select_baseline(&entries, &by_contract).unwrap().after_bytes, 1200);
+
+        // No contract tag (single run) — falls back to the wasm file name,
+        // which survives the report being saved from a different checkout.
+        let by_wasm = report(1000, 650);
+        assert_eq!(select_baseline(&entries, &by_wasm).unwrap().after_bytes, 700);
+
+        let unknown = OptimizeReport::new(Path::new("x/other.wasm"), Path::new("x/other.optimized.wasm"), 10, 9);
+        assert!(select_baseline(&entries, &unknown).is_none());
+
+        // A single-entry baseline is used even if the file name differs.
+        let single = vec![entries[0].clone()];
+        assert_eq!(select_baseline(&single, &unknown).unwrap().after_bytes, 700);
+    }
+
+    // ---- --all (issue #412) ----
+
+    fn write(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn contract_manifest(name: &str) -> String {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [lib]\ncrate-type = [\"lib\", \"cdylib\"]\n\n\
+             [dependencies]\nsoroban-sdk = {{ workspace = true }}\n"
+        )
+    }
+
+    fn workspace_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"contracts/*\", \"crates/helpers\"]\n",
+        );
+        write(&root.join("contracts/token/Cargo.toml"), &contract_manifest("my-token"));
+        write(&root.join("contracts/pool/Cargo.toml"), &contract_manifest("pool"));
+        // A plain library crate in the workspace is not a contract.
+        write(
+            &root.join("crates/helpers/Cargo.toml"),
+            "[package]\nname = \"helpers\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        tmp
+    }
+
+    #[test]
+    fn discovers_every_contract_crate_in_a_workspace() {
+        let tmp = workspace_fixture();
+        let contracts = discover_contracts(tmp.path()).unwrap();
+        let names: Vec<_> = contracts.iter().map(|c| c.crate_name.as_str()).collect();
+        assert_eq!(names, vec!["pool", "my_token"]);
+        assert!(contracts[1].dir.ends_with("contracts/token"));
+    }
+
+    #[test]
+    fn a_single_contract_project_is_a_workspace_of_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("Cargo.toml"), &contract_manifest("solo"));
+        let contracts = discover_contracts(tmp.path()).unwrap();
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].crate_name, "solo");
+    }
+
+    #[test]
+    fn discover_requires_a_cargo_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = discover_contracts(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("not a cargo project"), "{err}");
+    }
+
+    #[test]
+    fn contract_wasm_prefers_the_shared_workspace_target() {
+        let tmp = workspace_fixture();
+        let root = tmp.path();
+        let contracts = discover_contracts(root).unwrap();
+        let pool = &contracts[0];
+
+        assert_eq!(contract_wasm(root, pool), None);
+
+        let member_target = locate_wasm(&pool.dir, "pool");
+        write(&member_target, "\0asm");
+        assert_eq!(contract_wasm(root, pool), Some(member_target));
+
+        let shared = locate_wasm(root, "pool");
+        write(&shared, "\0asm");
+        assert_eq!(contract_wasm(root, pool), Some(shared));
+    }
+
+    #[test]
+    fn all_outputs_one_result_per_contract() {
+        let outcomes = vec![
+            ContractOutcome {
+                contract: "pool".into(),
+                result: Ok(report(1000, 750).with_contract("pool")),
+            },
+            ContractOutcome {
+                contract: "my_token".into(),
+                result: Err("no release build found".into()),
+            },
+        ];
+
+        let json: serde_json::Value = serde_json::from_str(&json_all(&outcomes)).unwrap();
+        let array = json.as_array().expect("--all --json emits an array");
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0]["contract"], "pool");
+        assert_eq!(array[0]["after_bytes"], 750);
+        assert_eq!(array[1]["contract"], "my_token");
+        assert_eq!(array[1]["error"], "no release build found");
+
+        // An --all array saved to disk is itself a valid --compare-to baseline.
+        let baseline = parse_baseline(&json_all(&outcomes)).unwrap();
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(baseline[0].contract.as_deref(), Some("pool"));
+
+        let text = format_all(&outcomes);
+        assert!(text.contains("[pool] optimized"), "{text}");
+        assert!(text.contains("[my_token] failed: no release build found"), "{text}");
+        assert!(text.contains("2 contract(s): 1 optimized, 1 failed"), "{text}");
+    }
+
+    #[test]
+    fn help_documents_all_and_compare_to() {
+        let help = OptimizePlugin.command().render_long_help().to_string();
+        assert!(help.contains("--all"), "{help}");
+        assert!(help.contains("--compare-to"), "{help}");
+    }
+
+    #[test]
+    fn all_conflicts_with_wasm() {
+        let err = OptimizePlugin
+            .command()
+            .try_get_matches_from(["optimize", "--all", "--wasm", "x.wasm"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

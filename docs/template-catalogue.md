@@ -21,7 +21,7 @@ scripts/gen-template-catalogue.py
 | [`escrow`](#escrow) | token escrow with approval or timeout-based refund path |
 | [`faucet`](#faucet) | token faucet dispensing a fixed amount per address with a cooldown |
 | [`flash-loan`](#flash-loan) | uncollateralized single-transaction loan repaid via a borrower callback |
-| [`governance`](#governance) | DAO governance with weighted voting, quorum, and proposal execution |
+| [`governance`](#governance) | DAO governance with one-member-one-vote, quorum, and proposal execution |
 | [`hello-world`](#hello-world) | minimal greeter contract (recommended starting point) |
 | [`lottery`](#lottery) | randomized lottery with ticket purchases and prize pool distribution |
 | [`merkle-airdrop`](#merkle-airdrop) | one-claim-per-address airdrop verified against a merkle root |
@@ -204,11 +204,28 @@ what can go wrong goes wrong in the *contracts around* the pool.
 
 > `templates/governance/` has no `template.toml` manifest — variables and post-generate hints for it, if any, are not declared.
 
-DAO governance with weighted voting, quorum, and proposal execution
+DAO-style governance: members open proposals and vote on them; a proposal
+executes once its voting period ends with quorum and a majority in favour.
 
-**Entrypoints:** `initialize`, `create_proposal`, `cast_vote`, `execute_proposal`, `get_proposal`
+**Voting power.** Every registered member has exactly one vote per
+proposal. Callers cannot choose their weight: `cast_vote` takes no weight
+argument and always counts `VOTE_WEIGHT` (1), so a single voter can never
+outvote everyone else, and negative or inflated votes are impossible by
+construction.
 
-**When to pick it:** on-chain DAO decisions that need weighted voting, quorum, and automatic execution of the winning proposal
+Members are registered by the admin. Eligibility is snapshotted per
+proposal: only members registered at or before the ledger a proposal was
+created in may vote on it, so adding members mid-vote cannot swing an open
+proposal. Removing a member revokes their ability to vote from then on.
+
+To weight votes by token holdings instead, replace `voting_power` with a
+balance read through `token::Client` — and snapshot balances when the
+proposal is created, or the same tokens can be moved between accounts and
+voted with repeatedly.
+
+**Entrypoints:** `initialize`, `add_member`, `remove_member`, `is_member`, `member_count`, `create_proposal`, `cast_vote`, `execute_proposal`, `get_proposal`
+
+**When to pick it:** on-chain DAO decisions by a known set of members, with one vote each, quorum, and automatic execution of the winning proposal
 
 ## hello-world
 
@@ -356,7 +373,9 @@ so state stays inspectable during an incident.
 
 Payment splitter — distributes received funds to payees by fixed shares.
 
-Payees and their shares are fixed at initialization. Every deposit is
+Payees and their shares are fixed at initialization, which can only run
+once — afterwards nobody, including the deployer, can rewrite the payee
+table. Every deposit is
 credited to the pool, and each payee can withdraw their proportional cut
 at any time:
 

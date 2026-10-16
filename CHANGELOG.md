@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `soroban-forge optimize --all` optimizes every contract crate in a
+  workspace in one invocation, reporting one result per contract (an array
+  under `--json`) (#412)
+- `soroban-forge optimize --compare-to <report.json>` reports the size delta
+  (bytes and percent) against a report saved from an earlier
+  `optimize --json` run (#418)
+- `soroban-forge network list --check` probes each configured endpoint and
+  annotates which networks are reachable; plain `network list` stays
+  offline (#411)
 - `soroban-forge identity remove <name>` deletes a stored identity and reports
   a clear error when the name is not found (#420)
 - `soroban-forge --list --json` now emits structured `builtin` and `external`
@@ -47,9 +56,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   changelog (#265)
 - `docs/releasing.md`: the maintainer release process from version bump to
   published release, with each step marked manual or automated (#264)
+- `soroban-forge identity import <name> --secret <S...>` (or `--secret-stdin`)
+  registers an existing keypair, deriving and validating the public key (#421)
+- `soroban-forge identity show <name> [--reveal-secret]` retrieves a stored
+  identity; the secret key is printed only with the explicit flag (#422)
 
 ### Fixed
 
+- `soroban-forge optimize` failures now include `stellar contract optimize`'s
+  stderr in the error message instead of only the exit status; under `-v` the
+  output still streams live (#417)
 - `soroban-forge bindings ts` panicked ("Unknown argument or group id")
   on the plain, no-flags invocation — `--out-dir`'s fallback lookup queried
   its own `visible_alias` ("output") as if it were a second, separate arg id
@@ -59,6 +75,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - New `pausable` template — a minimal circuit breaker: an admin fixed at
   deploy time can `pause`/`unpause`, and guarded entrypoints reject calls with
   `Error::Paused` while paused
+- Templates `merkle-airdrop`, `faucet`, `subscription` and `streaming`:
+  `initialize` can no longer be re-run. Anyone could previously call it again
+  to take over the airdrop admin and `sweep`, drain the faucet, redirect
+  subscription pulls to themselves, or redirect a funded stream; each now
+  fails with `already initialized` (#505, #506, #507, #508)
 - `soroban-forge new --license apache-2.0|mit|unlicense` writes a LICENSE
   file (author and year filled in) and sets the matching `license` field in
   the generated `Cargo.toml`. Omitting the flag keeps prior behaviour: no
@@ -107,6 +128,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   transfer unwound with the panic. Ships a `README.md` with the pattern's
   security caveats and 13 tests covering repaying, non-repaying, partially
   repaying and re-entering borrowers (#216)
+- `soroban-forge doctor` reports a missing optional `wasm32-unknown-unknown`
+  target as a warning instead of a failure, so it no longer makes doctor exit
+  non-zero (#484)
+- Repaired `doctor` and `identity` unit tests left unbalanced by a merge, which
+  stopped those crates' test suites from compiling; the mainnet RPC test for
+  `doctor`'s `config_network_url` now runs (#485)
 
 ### Changed
 
@@ -155,3 +182,17 @@ forge_tests` inside `src/`
 - Comprehensive documentation suite
 - Example contracts for common DeFi patterns
 - CI pipeline with fmt, clippy, test, and WASM build steps
+
+### Security
+
+- `governance` template: `cast_vote` no longer takes a caller-supplied
+  `weight`, which let one voter pass any proposal (or subtract votes with a
+  negative weight). Each admin-registered member now has exactly one vote,
+  snapshotted at proposal creation; the README explains where voting power
+  comes from and how to switch to snapshotted token weighting (#512)
+- `storage-migration` template: `init` runs only once and refuses to
+  overwrite existing v1 or v2 state (#511)
+- `payment-splitter` template: `initialize` can no longer be re-run to
+  rewrite the payee table and reset deposit accounting (#510)
+- `lottery` template: a second `initialize` is rejected, so an in-progress
+  or finished lottery can no longer be reset or taken over (#509)

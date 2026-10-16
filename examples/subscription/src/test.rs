@@ -188,3 +188,36 @@ fn charging_a_stranger_fails() {
 
     f.contract.charge(&stranger);
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn initialize_twice_is_rejected() {
+    let env = Env::default();
+    let f = setup(&env);
+    f.contract
+        .initialize(&f.merchant, &f.token.address, &AMOUNT, &INTERVAL);
+}
+
+#[test]
+fn an_attacker_cannot_reinitialize_to_become_the_merchant() {
+    let env = Env::default();
+    let f = setup(&env);
+    f.contract.subscribe(&f.subscriber);
+
+    let attacker = Address::generate(&env);
+    let result = f
+        .contract
+        .try_initialize(&attacker, &f.token.address, &FUNDED, &1);
+    assert!(result.is_err(), "re-initialization must fail");
+
+    // Plan parameters are untouched...
+    assert_eq!(f.contract.merchant(), f.merchant);
+    assert_eq!(f.contract.amount(), AMOUNT);
+    assert_eq!(f.contract.interval(), INTERVAL);
+
+    // ...so the next charge still pays the real merchant one period's amount.
+    env.ledger().with_mut(|li| li.timestamp = START_TS + INTERVAL);
+    f.contract.charge(&f.subscriber);
+    assert_eq!(f.token.client.balance(&f.merchant), 2 * AMOUNT);
+    assert_eq!(f.token.client.balance(&attacker), 0);
+}

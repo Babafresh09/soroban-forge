@@ -184,7 +184,7 @@ pub fn template_description(name: &str) -> Option<&'static str> {
         "flash-loan" => Some(
             "uncollateralized single-transaction loan repaid via a borrower callback",
         ),
-        "governance" => Some("DAO governance with weighted voting, quorum, and proposal execution"),
+        "governance" => Some("DAO governance with one-member-one-vote, quorum, and proposal execution"),
         "hello-world" => Some("minimal greeter contract (recommended starting point)"),
         "lottery" => Some("randomized lottery with ticket purchases and prize pool distribution"),
         "merkle-airdrop" => Some("one-claim-per-address airdrop verified against a merkle root"),

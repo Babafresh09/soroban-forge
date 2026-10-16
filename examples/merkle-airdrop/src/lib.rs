@@ -48,7 +48,15 @@ impl MerkleAirdropContract {
     /// * `admin` — address that funds the contract and may replace the root
     /// * `token` — contract address of the SEP-41 token being distributed
     /// * `root`  — merkle root of the `(address, amount)` allowlist
+    ///
+    /// Runs once: the admin, token and initial root are fixed at deployment.
+    /// Without this guard `require_auth` would only prove the *new* admin
+    /// agreed, so anyone could re-initialize naming themselves admin and then
+    /// `sweep` the funded balance or `set_root` to approve their own claims.
     pub fn initialize(env: Env, admin: Address, token: Address, root: BytesN<32>) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);

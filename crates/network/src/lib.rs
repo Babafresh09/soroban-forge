@@ -10,7 +10,9 @@
 //! so that `deploy`, `invoke`, and `verify` share a single source of truth.
 
 use std::collections::BTreeMap;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use clap::{Arg, ArgMatches, Command};
 use serde::{Deserialize, Serialize};
@@ -227,18 +229,51 @@ pub fn patch_forge_toml_network(existing: &str, name: &str) -> String {
     result
 }
 
-/// Format the network list for display.
-pub fn format_list(store: &NetworkStore) -> String {
-    // Collect user-defined networks plus built-in presets (#289).
-    // Built-ins that have been overridden by the user store show the user value.
+/// Every network `list` shows: user-defined entries plus built-in presets
+/// (#289), sorted by name.
+pub fn listed_names(store: &NetworkStore) -> Vec<String> {
     let builtins = ["testnet", "futurenet", "mainnet", "localnet"];
-    let mut all_names: Vec<&str> = store.networks.keys().map(String::as_str).collect();
+    let mut all_names: Vec<String> = store.networks.keys().cloned().collect();
     for b in &builtins {
         if !store.networks.contains_key(*b) {
-            all_names.push(b);
+            all_names.push(b.to_string());
         }
     }
     all_names.sort();
+    all_names
+}
+
+/// Format the network list for display.
+///
+/// Fully offline: this never touches the network.  `network list --check`
+/// uses [`format_list_checked`] instead.
+pub fn format_list(store: &NetworkStore) -> String {
+    format_list_with(store, None)
+}
+
+/// Format the network list annotated with reachability results
+/// (`network list --check`, issue #411).
+pub fn format_list_checked(
+    store: &NetworkStore,
+    checks: &BTreeMap<String, Reachability>,
+) -> String {
+    let mut out = format_list_with(store, Some(checks));
+    let unreachable = checks.values().filter(|r| !r.is_reachable()).count();
+    out.push_str(&format!(
+        "\n{} of {} network(s) reachable\n",
+        checks.len() - unreachable,
+        checks.len()
+    ));
+    out
+}
+
+fn format_list_with(
+    store: &NetworkStore,
+    checks: Option<&BTreeMap<String, Reachability>>,
+) -> String {
+    // Built-ins that have been overridden by the user store show the user value.
+    let names = listed_names(store);
+    let all_names: Vec<&str> = names.iter().map(String::as_str).collect();
 
     if all_names.is_empty() {
         return "no networks available.\n".to_string();
@@ -259,16 +294,167 @@ pub fn format_list(store: &NetworkStore) -> String {
         } else {
             "  [built-in]"
         };
+        let status = checks
+            .and_then(|c| c.get(*name))
+            .map(|r| format!("  {}", r.label()))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "{marker} {:<width$}  {}  ({}){}\n",
+            "{marker} {:<width$}  {}  ({}){}{}\n",
             name,
             network.rpc_url,
             network.network_passphrase,
             tag,
+            status,
             width = name_width
         ));
     }
     out
+}
+
+// ---- reachability probe (`network list --check`, issue #411) ----
+
+/// Default per-endpoint probe timeout when `--timeout` is not given.
+pub const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Result of probing one network's RPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reachability {
+    /// A TCP connection to the endpoint's host and port succeeded.
+    Reachable { latency_ms: u64 },
+    /// The endpoint could not be reached; the string says why.
+    Unreachable(String),
+}
+
+impl Reachability {
+    pub fn is_reachable(&self) -> bool {
+        matches!(self, Reachability::Reachable { .. })
+    }
+
+    /// Short annotation appended to a `network list --check` row.
+    pub fn label(&self) -> String {
+        match self {
+            Reachability::Reachable { latency_ms } => format!("[reachable, {latency_ms}ms]"),
+            Reachability::Unreachable(reason) => format!("[unreachable: {reason}]"),
+        }
+    }
+
+    /// Fields merged into a network's `--json` entry.
+    pub fn json_fields(&self) -> serde_json::Value {
+        match self {
+            Reachability::Reachable { latency_ms } => serde_json::json!({
+                "reachable": true,
+                "latency_ms": latency_ms,
+            }),
+            Reachability::Unreachable(reason) => serde_json::json!({
+                "reachable": false,
+                "error": reason,
+            }),
+        }
+    }
+}
+
+/// Extract `(host, port)` from an RPC URL, defaulting the port from the
+/// scheme (443 for https, 80 for http).  Handles bracketed IPv6 hosts and
+/// strips userinfo, paths, queries and fragments.
+pub fn endpoint_host_port(url: &str) -> std::result::Result<(String, u16), String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("`{url}` has no scheme"))?;
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "https" | "wss" => 443,
+        "http" | "ws" => 80,
+        other => return Err(format!("unsupported scheme `{other}`")),
+    };
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (host, tail) = after_bracket
+            .split_once(']')
+            .ok_or_else(|| format!("`{url}` has an unterminated IPv6 address"))?;
+        (host, tail.strip_prefix(':'))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+
+    if host.is_empty() {
+        return Err(format!("`{url}` has no host"));
+    }
+    let port = match port {
+        Some(p) => p.parse::<u16>().map_err(|_| format!("`{url}` has an invalid port `{p}`"))?,
+        None => default_port,
+    };
+    Ok((host.to_string(), port))
+}
+
+/// Lightweight reachability probe: resolve the endpoint and open (then
+/// immediately drop) a TCP connection, bounded by `timeout`.  No RPC request
+/// is sent, so it is cheap and side-effect free; it answers "can this machine
+/// reach the endpoint right now", which is what `list --check` reports.
+pub fn probe_endpoint(url: &str, timeout: Duration) -> Reachability {
+    let (host, port) = match endpoint_host_port(url) {
+        Ok(hp) => hp,
+        Err(reason) => return Reachability::Unreachable(reason),
+    };
+
+    let started = Instant::now();
+    let addrs: Vec<_> = match (host.as_str(), port).to_socket_addrs() {
+        Ok(addrs) => addrs.collect(),
+        Err(e) => return Reachability::Unreachable(format!("cannot resolve {host}: {e}")),
+    };
+    if addrs.is_empty() {
+        return Reachability::Unreachable(format!("cannot resolve {host}"));
+    }
+
+    let mut last_error = None;
+    for addr in addrs {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&addr, remaining) {
+            Ok(_) => {
+                return Reachability::Reachable {
+                    latency_ms: started.elapsed().as_millis() as u64,
+                }
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Reachability::Unreachable(match last_error {
+        Some(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            format!("timed out after {}s", timeout.as_secs_f64())
+        }
+        Some(e) => e.to_string(),
+        None => format!("timed out after {}s", timeout.as_secs_f64()),
+    })
+}
+
+/// Probe every listed network concurrently, so one slow endpoint does not
+/// multiply the wait.  Returns results keyed by network name.
+pub fn probe_networks(store: &NetworkStore, timeout: Duration) -> BTreeMap<String, Reachability> {
+    let handles: Vec<_> = listed_names(store)
+        .into_iter()
+        .filter_map(|name| resolve_network(store, &name).map(|n| (name, n.rpc_url)))
+        .map(|(name, url)| {
+            let handle = std::thread::spawn(move || probe_endpoint(&url, timeout));
+            (name, handle)
+        })
+        .collect();
+
+    handles
+        .into_iter()
+        .map(|(name, handle)| {
+            let result = handle
+                .join()
+                .unwrap_or_else(|_| Reachability::Unreachable("probe panicked".into()));
+            (name, result)
+        })
+        .collect()
 }
 
 /// Validate that a URL string has a scheme and a non-empty host.
@@ -344,7 +530,16 @@ impl ForgePlugin for NetworkPlugin {
                             .help("Overwrite an existing network with the same name"),
                     ),
             )
-            .subcommand(Command::new("list").about("List all configured networks (including built-in presets)"))
+            .subcommand(
+                Command::new("list")
+                    .about("List all configured networks (including built-in presets)")
+                    .arg(
+                        Arg::new("check")
+                            .long("check")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Probe each network's RPC endpoint and mark it reachable or unreachable (needs network access; honours --timeout)"),
+                    ),
+            )
             .subcommand(
                 Command::new("use")
                     .about("Select the default network for other commands and persist it to forge.toml")
@@ -436,8 +631,26 @@ impl ForgePlugin for NetworkPlugin {
                 Ok(())
             }
 
-            Some(("list", _sub)) => {
+            Some(("list", sub)) => {
                 let store = load_store(&path)?;
+
+                // #411 — opt-in reachability probe; the default listing
+                // stays fully offline.
+                let checks = if sub.get_flag("check") {
+                    if ctx.offline {
+                        return Err(ForgeError::InvalidArgument(
+                            "network list --check probes each endpoint and is unavailable in offline mode".into(),
+                        ));
+                    }
+                    let timeout = ctx
+                        .timeout_secs
+                        .map(Duration::from_secs)
+                        .unwrap_or(DEFAULT_CHECK_TIMEOUT);
+                    Some(probe_networks(&store, timeout))
+                } else {
+                    None
+                };
+
                 if ctx.json {
                     // #289 — include built-in presets that are not in the user store
                     let builtins = ["testnet", "futurenet", "mainnet", "localnet"];
@@ -465,13 +678,28 @@ impl ForgePlugin for NetworkPlugin {
                             }),
                         );
                     }
+                    if let Some(checks) = &checks {
+                        // #411 — annotate each entry with its probe result.
+                        for (name, entry) in all.iter_mut() {
+                            if let (Some(result), Some(entry)) =
+                                (checks.get(name), entry.as_object_mut())
+                            {
+                                if let serde_json::Value::Object(fields) = result.json_fields() {
+                                    entry.extend(fields);
+                                }
+                            }
+                        }
+                    }
                     let report = serde_json::json!({
                         "networks": all,
                         "default": store.default,
                     });
                     println!("{}", serde_json::to_string_pretty(&report).unwrap());
                 } else if !ctx.quiet {
-                    print!("{}", format_list(&store));
+                    match &checks {
+                        Some(checks) => print!("{}", format_list_checked(&store, checks)),
+                        None => print!("{}", format_list(&store)),
+                    }
                 }
                 Ok(())
             }
@@ -1057,5 +1285,168 @@ mod tests {
         store.default = Some("localnet".into());
         let ctx = ForgeContext::new(dir.path().to_path_buf(), 0).unwrap();
         assert_eq!(active_network_name(&store, &ctx, None), Some("futurenet"));
+    }
+
+    // ---- network list --check (issue #411) ----
+
+    /// A live local endpoint: the listener accepts connections for the
+    /// lifetime of the returned handle.
+    fn reachable_endpoint() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, format!("http://127.0.0.1:{port}/soroban/rpc"))
+    }
+
+    /// A local URL nothing listens on: bind a port, then release it.
+    fn unreachable_endpoint() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        format!("http://127.0.0.1:{port}/soroban/rpc")
+    }
+
+    fn net(url: &str) -> Network {
+        Network {
+            rpc_url: url.into(),
+            network_passphrase: "Mock Network".into(),
+        }
+    }
+
+    #[test]
+    fn endpoint_host_port_defaults_and_parses_ports() {
+        assert_eq!(
+            endpoint_host_port("https://soroban-testnet.stellar.org").unwrap(),
+            ("soroban-testnet.stellar.org".into(), 443)
+        );
+        assert_eq!(
+            endpoint_host_port("http://localhost:8000/soroban/rpc").unwrap(),
+            ("localhost".into(), 8000)
+        );
+        assert_eq!(
+            endpoint_host_port("http://example.com/rpc?x=1").unwrap(),
+            ("example.com".into(), 80)
+        );
+        assert_eq!(
+            endpoint_host_port("https://user:pw@rpc.example.com:8443/v1").unwrap(),
+            ("rpc.example.com".into(), 8443)
+        );
+        assert_eq!(
+            endpoint_host_port("http://[::1]:9000/rpc").unwrap(),
+            ("::1".into(), 9000)
+        );
+        assert!(endpoint_host_port("rpc.example.com").is_err());
+        assert!(endpoint_host_port("ftp://rpc.example.com").is_err());
+        assert!(endpoint_host_port("http://:8000").is_err());
+        assert!(endpoint_host_port("http://host:notaport").is_err());
+    }
+
+    #[test]
+    fn probe_detects_reachable_and_unreachable_endpoints() {
+        let (_listener, up) = reachable_endpoint();
+        let down = unreachable_endpoint();
+
+        assert!(probe_endpoint(&up, Duration::from_secs(2)).is_reachable());
+
+        let result = probe_endpoint(&down, Duration::from_secs(2));
+        assert!(!result.is_reachable(), "{result:?}");
+        assert!(result.label().starts_with("[unreachable: "), "{}", result.label());
+    }
+
+    #[test]
+    fn probe_reports_malformed_urls_as_unreachable() {
+        let result = probe_endpoint("not a url", Duration::from_secs(1));
+        assert_eq!(result, Reachability::Unreachable("`not a url` has no scheme".into()));
+    }
+
+    #[test]
+    fn checked_list_annotates_a_mix_of_reachable_and_unreachable_networks() {
+        let (_listener, up) = reachable_endpoint();
+        let down = unreachable_endpoint();
+
+        let mut store = NetworkStore::default();
+        store.networks.insert("alpha-up".into(), net(&up));
+        store.networks.insert("beta-down".into(), net(&down));
+
+        let mut checks = BTreeMap::new();
+        for name in ["alpha-up", "beta-down"] {
+            let url = &store.networks[name].rpc_url;
+            checks.insert(name.to_string(), probe_endpoint(url, Duration::from_secs(2)));
+        }
+
+        let out = format_list_checked(&store, &checks);
+        let line = |name: &str| {
+            out.lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name}: {out}"))
+                .to_string()
+        };
+        assert!(line("alpha-up").contains("[reachable, "), "{out}");
+        assert!(line("alpha-up").contains(&up), "{out}");
+        assert!(line("beta-down").contains("[unreachable: "), "{out}");
+        assert!(out.contains("1 of 2 network(s) reachable"), "{out}");
+        // Networks that were not probed carry no annotation.
+        assert!(!line("testnet").contains("reachable"), "{out}");
+    }
+
+    #[test]
+    fn plain_list_is_unchanged_and_never_annotated() {
+        let (_listener, up) = reachable_endpoint();
+        let mut store = NetworkStore::default();
+        store.networks.insert("alpha-up".into(), net(&up));
+
+        let out = format_list(&store);
+        assert!(!out.contains("reachable"), "{out}");
+        assert!(out.contains(&format!("alpha-up   {up}  (Mock Network)")), "{out}");
+    }
+
+    #[test]
+    fn reachability_json_fields() {
+        assert_eq!(
+            Reachability::Reachable { latency_ms: 12 }.json_fields(),
+            serde_json::json!({ "reachable": true, "latency_ms": 12 })
+        );
+        assert_eq!(
+            Reachability::Unreachable("connection refused".into()).json_fields(),
+            serde_json::json!({ "reachable": false, "error": "connection refused" })
+        );
+    }
+
+    #[test]
+    fn probe_networks_covers_every_listed_network() {
+        let (_listener, up) = reachable_endpoint();
+        let down = unreachable_endpoint();
+
+        // Override every built-in so the probe never leaves the machine.
+        let mut store = NetworkStore::default();
+        for name in ["testnet", "futurenet", "mainnet", "localnet"] {
+            store.networks.insert(name.into(), net(&down));
+        }
+        store.networks.insert("alpha-up".into(), net(&up));
+
+        let checks = probe_networks(&store, Duration::from_secs(2));
+        assert_eq!(checks.len(), 5);
+        assert!(checks["alpha-up"].is_reachable());
+        for name in ["testnet", "futurenet", "mainnet", "localnet"] {
+            assert!(!checks[name].is_reachable(), "{name}: {:?}", checks[name]);
+        }
+    }
+
+    #[test]
+    fn list_accepts_the_check_flag() {
+        let matches = NetworkPlugin
+            .command()
+            .try_get_matches_from(["network", "list", "--check"])
+            .unwrap();
+        let (name, sub) = matches.subcommand().unwrap();
+        assert_eq!(name, "list");
+        assert!(sub.get_flag("check"));
+
+        let plain = NetworkPlugin
+            .command()
+            .try_get_matches_from(["network", "list"])
+            .unwrap();
+        assert!(!plain.subcommand().unwrap().1.get_flag("check"));
     }
 }

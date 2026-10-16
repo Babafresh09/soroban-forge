@@ -180,3 +180,50 @@ fn test_migration_with_multiple_data_points() {
     // Verify version is still 2 (no re-migration)
     assert_eq!(client.version(), 2);
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn test_init_twice_fails() {
+    let env = Env::default();
+    let client = StorageMigrationClient::new(&env, &env.register(StorageMigration, ()));
+
+    client.init(&1, &String::from_slice(&env, "first"));
+    client.init(&999, &String::from_slice(&env, "overwrite"));
+}
+
+#[test]
+fn test_second_init_leaves_state_untouched() {
+    let env = Env::default();
+    let client = StorageMigrationClient::new(&env, &env.register(StorageMigration, ()));
+
+    let name = String::from_slice(&env, "first");
+    client.init(&1, &name);
+    client.increment();
+
+    assert!(client
+        .try_init(&999, &String::from_slice(&env, "overwrite"))
+        .is_err());
+    assert_eq!(client.get_counter(), 2);
+    assert_eq!(client.get_name(), name);
+}
+
+#[test]
+fn test_init_cannot_clobber_migrated_v1_state() {
+    let env = Env::default();
+    let contract_id = env.register(StorageMigration, ());
+    let client = StorageMigrationClient::new(&env, &contract_id);
+
+    // A contract upgraded from v1 with live data.
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::CounterV1, &77u32);
+        env.storage().instance().set(&DataKey::Version, &1u32);
+    });
+
+    // init would otherwise migrate and then overwrite the migrated counter.
+    assert!(client.try_init(&0, &String::from_slice(&env, "reset")).is_err());
+
+    // The migration example still works end to end.
+    assert_eq!(client.get_counter(), 77);
+    assert_eq!(client.get_name(), String::from_slice(&env, "migrated"));
+    assert_eq!(client.version(), 2);
+}

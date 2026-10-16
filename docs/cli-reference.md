@@ -101,10 +101,46 @@ scaffolding.
     a single canonical path without accidentally picking up the unoptimized
     file. The replacement is atomic: if anything fails before the optimized
     bytes are committed, the original wasm is left byte-for-byte untouched.
+  - `--all` — optimize every contract crate in the workspace at `--path` (or
+    the current directory): every `[workspace].members` crate that builds a
+    `cdylib` or depends on `soroban-sdk`. Each contract's release wasm is read
+    from the workspace's shared `target/` (falling back to the member's own).
+    Human output prints one block per contract plus a summary; `--json`
+    prints an array of reports, each tagged with `contract` (a contract that
+    failed appears as `{"contract", "error"}`). Every contract is attempted;
+    the command exits `1` afterwards if any failed. Cannot be combined with
+    `--wasm`.
+  - `--compare-to <report.json>` — compare this run's optimized size against
+    a report saved earlier with `optimize --json > report.json` (or
+    `optimize --all --json`). Adds a `vs baseline` line to human output and a
+    `comparison` object (`baseline_after_bytes`, `delta_bytes`,
+    `delta_percent`) to `--json`; a negative delta means the wasm shrank. With
+    `--all`, each contract is matched to its baseline entry by contract name,
+    then wasm file name.
+  - When `stellar contract optimize` fails, the error now includes the CLI's
+    own stderr. Under `-v` its output also streams live.
+- `soroban-forge network list [--check]` — list configured networks and
+  built-in presets. Plain `list` never touches the network. `--check` opens a
+  TCP connection to each RPC endpoint (bounded by `--timeout`, default 3s, all
+  probed in parallel) and marks each row `[reachable, <n>ms]` or
+  `[unreachable: <reason>]`, followed by a reachable count; with `--json`,
+  each network gains `reachable` plus `latency_ms` or `error`. Refused under
+  `--offline`.
 - `soroban-forge verify <contract-id> [--network <n>]` — compare a deployed
   contract's wasm hash with the local release build; exits `1` on a mismatch.
   See [Contract Verification](contract-verification.md).
 
+- `soroban-forge identity import <name> (--secret <S...> | --secret-stdin) [--force]` —
+  register an existing Stellar keypair (e.g. a CI secret or a key generated
+  elsewhere). The public key is derived from the secret, which must be a valid
+  `S...` strkey; malformed keys are rejected without being echoed. An existing
+  name needs `--force`, exactly like `identity generate`. Prefer
+  `--secret-stdin` (`echo "$SECRET" | soroban-forge identity import ci --secret-stdin`)
+  so the key stays out of shell history.
+- `soroban-forge identity show <name> [--reveal-secret]` — print a stored
+  identity's public key. The secret key is printed only with the explicit
+  `--reveal-secret` flag (also in `--json`); `show` and `list` never print
+  secrets by default.
 - `soroban-forge deploy [--source <name|pubkey>] [--network <n>] [--rpc-url <url>] [--fund] [--dry-run]` — deploy
   a built contract to a network.
   - `--source <name>` — the identity or public key used to sign and pay for deployment.

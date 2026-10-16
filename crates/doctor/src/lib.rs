@@ -465,6 +465,36 @@ fn wasm32_target_check(project_dir: &Path) -> Check {
     }
 }
 
+/// Classify the optional legacy `wasm32-unknown-unknown` target (#45, #484).
+///
+/// `installed_targets` is the output of `rustup target list --installed`, or
+/// `None` when rustup could not be run. The required target is
+/// `wasm32v1-none`, which has its own check; this one is informational, so a
+/// missing legacy target is a [`Status::Warn`], never a [`Status::Fail`], and
+/// therefore never affects [`failure_count`] or doctor's exit code.
+pub fn classify_legacy_wasm_target(installed_targets: Option<&str>, rustup_present: bool) -> Check {
+    match installed_targets {
+        Some(targets) if targets.lines().any(|t| t.trim() == "wasm32-unknown-unknown") => Check {
+            name: "wasm32-unknown-unknown",
+            status: Status::Pass,
+            detail: "installed".into(),
+            fix: None,
+        },
+        Some(_) => Check {
+            name: "wasm32-unknown-unknown",
+            status: Status::Warn,
+            detail: "not installed (optional legacy target; only needed by projects that still build for wasm32-unknown-unknown)".into(),
+            fix: missing_target_fix("wasm32-unknown-unknown", rustup_present),
+        },
+        None => Check {
+            name: "wasm32-unknown-unknown",
+            status: Status::Warn,
+            detail: "rustup not found — could not verify".into(),
+            fix: missing_target_fix("wasm32-unknown-unknown", false),
+        },
+    }
+}
+
 /// Classify a git identity probe into a report line (issue #71).
 ///
 /// `new` initializes a git repo, and the first commit fails confusingly when
@@ -1012,28 +1042,10 @@ pub fn run_checks_with_network(allow_network: bool) -> Vec<Check> {
         } else {
             None
         };
-        checks.push(match installed_targets_wasm32 {
-            Some(targets) if targets.lines().any(|t| t.trim() == "wasm32-unknown-unknown") => {
-                Check {
-                    name: "wasm32-unknown-unknown",
-                    status: Status::Pass,
-                    detail: "installed".into(),
-                    fix: None,
-                }
-            }
-            Some(_) => Check {
-                name: "wasm32-unknown-unknown",
-                status: Status::Fail,
-                detail: "missing wasm32 target".into(),
-                fix: missing_target_fix("wasm32-unknown-unknown", rustup_present),
-            },
-            None => Check {
-                name: "wasm32-unknown-unknown",
-                status: Status::Warn,
-                detail: "rustup not found — could not verify".into(),
-                fix: missing_target_fix("wasm32-unknown-unknown", false),
-            },
-        });
+        checks.push(classify_legacy_wasm_target(
+            installed_targets_wasm32.as_deref(),
+            rustup_present,
+        ));
     }
 
     // stellar-cli — presence, minimum version and known-bad releases.
@@ -1650,6 +1662,38 @@ mod tests {
             detail: "rustc 1.84.0".into(),
             fix: None,
         }];
+        assert_eq!(failure_count(&checks), 0);
+    }
+
+    #[test]
+    fn classify_legacy_wasm_target_warns_instead_of_failing() {
+        // #484 — the real classifier, not a hand-built Check.
+        let missing = classify_legacy_wasm_target(Some("wasm32v1-none\nx86_64-unknown-linux-gnu\n"), true);
+        assert_eq!(missing.status, Status::Warn);
+        assert_eq!(missing.name, "wasm32-unknown-unknown");
+        assert!(missing.detail.contains("optional"), "{}", missing.detail);
+        assert_eq!(missing.fix, Some("rustup target add wasm32-unknown-unknown"));
+
+        let present = classify_legacy_wasm_target(Some("wasm32-unknown-unknown\nwasm32v1-none\n"), true);
+        assert_eq!(present.status, Status::Pass);
+
+        let unknown = classify_legacy_wasm_target(None, false);
+        assert_eq!(unknown.status, Status::Warn);
+    }
+
+    #[test]
+    fn project_missing_only_the_legacy_target_passes_doctor() {
+        // #484 — required wasm32v1-none present, legacy target absent: the
+        // overall result (failure_count → exit code) must be success.
+        let checks = [
+            Check {
+                name: "wasm32v1-none target",
+                status: Status::Pass,
+                detail: "installed".into(),
+                fix: None,
+            },
+            classify_legacy_wasm_target(Some("wasm32v1-none\n"), true),
+        ];
         assert_eq!(failure_count(&checks), 0);
     }
 

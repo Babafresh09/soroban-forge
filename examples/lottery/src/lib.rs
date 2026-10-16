@@ -39,7 +39,13 @@ impl LotteryContract {
     /// * `commit_deadline` — ledger timestamp after which entries close
     /// * `reveal_deadline` — ledger timestamp after which reveals close and
     ///   the winner can be drawn
+    ///
+    /// Can only be called once: a second call would let anyone replace the
+    /// admin, move the deadlines and wipe the entrants or a drawn winner.
     pub fn initialize(env: Env, admin: Address, commit_deadline: u64, reveal_deadline: u64) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
         admin.require_auth();
 
         if reveal_deadline <= commit_deadline {
