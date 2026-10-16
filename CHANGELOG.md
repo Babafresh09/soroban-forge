@@ -11,6 +11,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `soroban-forge optimize --all` optimizes every contract crate in a
   workspace in one invocation, reporting one result per contract (an array
   under `--json`) (#412)
+- `soroban-forge optimize --profile <name>`, `--target <triple>` and
+  `--target-dir <dir>` optimize a build outside the default
+  `target/wasm32v1-none/release`, keeping the crate-name detection that
+  derives the wasm's file name; `--profile dev` resolves to cargo's `debug/`
+  directory (#419)
 - `soroban-forge optimize --compare-to <report.json>` reports the size delta
   (bytes and percent) against a report saved from an earlier
   `optimize --json` run (#418)

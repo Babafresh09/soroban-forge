@@ -94,6 +94,17 @@ scaffolding.
   `saved_bytes == 0` as ambiguous. Human output reflects the same distinction
   in its wording. `--quiet` suppresses the report. On budget failure, the
   actual and budgeted sizes are printed.
+  - `--profile <name>`, `--target <triple>`, `--target-dir <dir>` — resolve
+    the wasm from a non-default build path while still deriving its file name
+    from the detected crate name, instead of spelling the whole path out with
+    `--wasm`. Each flag moves one part of the default
+    `<path>/target/wasm32v1-none/release/<crate>.wasm`: the profile directory
+    (`--profile dev` resolves to `debug/`, which is where cargo builds that
+    profile), the target triple, and the target directory (a relative
+    `--target-dir` is taken from the current directory). They say where the
+    build is rather than replacing it, so none of them can be combined with
+    `--wasm`; under `--all`, every contract is resolved against the same
+    layout.
   - `--in-place` — overwrite the input wasm with the optimized bytes and
     remove the intermediate `<stem>.optimized.wasm`, leaving only the original
     filename on disk (holding the optimized bytes). This is the supported way
