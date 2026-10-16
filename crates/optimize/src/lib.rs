@@ -16,6 +16,11 @@
 //! `--all` optimizes every contract crate of a Cargo workspace in one run
 //! (issue #412), and `--compare-to` diffs a run against a report previously
 //! saved with `optimize --json` (issue #418).
+//!
+//! `--profile`, `--target` and `--target-dir` optimize a build that is not
+//! the default `target/wasm32v1-none/release` one — a debug build, another
+//! triple, a shared target directory — without giving up the crate-name
+//! detection that names the file (issue #419).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
