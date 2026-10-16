@@ -26,6 +26,7 @@
 //! This is not telemetry: no user data, command arguments, project contents
 //! or identifiers are sent. See `docs/privacy.md`.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -126,12 +127,7 @@ fn http_get(url: &str) -> Option<String> {
 
     // Fallback: wget
     let wget_out = std::process::Command::new("wget")
-        .args([
-            "--quiet",
-            "--timeout=5",
-            "--output-document=-",
-            url,
-        ])
+        .args(["--quiet", "--timeout=5", "--output-document=-", url])
         .output();
 
     if let Ok(out) = wget_out {
@@ -153,13 +149,24 @@ fn http_get(url: &str) -> Option<String> {
 ///
 /// The hint (if any) is collected via a `JoinHandle<Option<String>>` that the
 /// caller should `wait_and_print` on *after* the main command has finished.
-pub fn spawn(offline: bool, update_check_enabled: bool) -> Option<std::thread::JoinHandle<Option<String>>> {
+pub fn spawn(
+    offline: bool,
+    update_check_enabled: bool,
+) -> Option<std::thread::JoinHandle<Option<String>>> {
     if offline {
         log::debug!("update-check: skipped (--offline)");
         return None;
     }
     if !update_check_enabled {
         log::debug!("update-check: skipped (disabled via config/env)");
+        return None;
+    }
+    if std::env::var_os("CI").is_some() {
+        log::debug!("update-check: skipped (CI)");
+        return None;
+    }
+    if !std::io::stderr().is_terminal() {
+        log::debug!("update-check: skipped (non-interactive stderr)");
         return None;
     }
     // Honour the SOROBAN_FORGE_NO_UPDATE_CHECK env variable.
