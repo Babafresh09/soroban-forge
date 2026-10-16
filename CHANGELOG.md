@@ -56,6 +56,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   changelog (#265)
 - `docs/releasing.md`: the maintainer release process from version bump to
   published release, with each step marked manual or automated (#264)
+- `soroban-forge identity import <name> --secret <S...>` (or `--secret-stdin`)
+  registers an existing keypair, deriving and validating the public key (#421)
+- `soroban-forge identity show <name> [--reveal-secret]` retrieves a stored
+  identity; the secret key is printed only with the explicit flag (#422)
 
 ### Fixed
 
@@ -119,6 +123,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   transfer unwound with the panic. Ships a `README.md` with the pattern's
   security caveats and 13 tests covering repaying, non-repaying, partially
   repaying and re-entering borrowers (#216)
+- `soroban-forge doctor` reports a missing optional `wasm32-unknown-unknown`
+  target as a warning instead of a failure, so it no longer makes doctor exit
+  non-zero (#484)
+- Repaired `doctor` and `identity` unit tests left unbalanced by a merge, which
+  stopped those crates' test suites from compiling; the mainnet RPC test for
+  `doctor`'s `config_network_url` now runs (#485)
 
 ### Changed
 
