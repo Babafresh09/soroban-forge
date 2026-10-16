@@ -483,13 +483,14 @@ mod resolved_tests {
     #[test]
     fn full_config_shows_configured_values() {
         let config: ForgeConfig = toml::from_str(
-            "[project]\nname = \"demo\"\nauthors = [\"Ada\"]\n[scaffold]\ndefault_template = \"token\"\n",
+            "[project]\nname = \"demo\"\nauthors = [\"Ada\"]\n[scaffold]\ndefault_template = \"token\"\n[defaults]\nupdate_check = true\n[identity]\ndefault = \"alice\"\n",
         )
         .unwrap();
         let report = resolved_report(&Some(config));
         assert!(report.contains("authors = [\"Ada\"]"));
         assert!(report.contains("default_template = \"token\"\n"));
-        assert!(!report.contains("# default"));
+        assert!(report.contains("default = \"alice\"\n"));
+        assert!(!report.contains("  # default"));
     }
 
     #[test]

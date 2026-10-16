@@ -27,6 +27,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
+use serde::{Deserialize, Serialize};
 use soroban_forge_core::render::{render_str, Vars};
 use soroban_forge_core::{ForgeContext, ForgeError, ForgePlugin, Result};
 
@@ -1788,11 +1789,20 @@ pub fn generate_with_layout(
 /// Returns `(info, written, skipped)`: `skipped` (#344) lists files whose
 /// on-disk content had drifted from their last-generated hash marker and so
 /// were left alone under `--force` (use `--force-all` to overwrite them too).
-pub fn generate_with_options_layout(
+/// A file planned to be written by `test-init`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlannedFile {
+    pub path: String,
+    pub size: usize,
+    pub overwrites: bool,
+}
+
+/// Collect the planned test files and their content without modifying the filesystem.
+pub fn collect_planned_files(
     dir: &Path,
     options: &GenerateOptions,
     layout: TestLayout,
-) -> Result<(ContractInfo, Vec<&'static str>, Vec<&'static str>)> {
+) -> Result<(ContractInfo, Vec<(&'static str, String)>)> {
     let info = detect::inspect(dir)?;
 
     let smoke = build_smoke_test(&info);
@@ -1913,63 +1923,89 @@ pub fn generate_with_options_layout(
         ));
     }
 
+    Ok((info, files))
+}
+
+/// Plan test files for `--dry-run` (#237), computing their sizes and checking
+/// if any would overwrite existing files, without touching the filesystem.
+pub fn plan_test_files(
+    dir: &Path,
+    options: &GenerateOptions,
+    layout: TestLayout,
+    bench: bool,
+    coverage: bool,
+) -> Result<(ContractInfo, Vec<PlannedFile>)> {
+    let (info, mut files) = collect_planned_files(dir, options, layout)?;
+    if bench {
+        let bench_contents = build_bench(&info);
+        if !bench_contents.is_empty() {
+            files.push(("benches/forge_bench.rs", bench_contents));
+        }
+    }
+    if coverage {
+        files.push(("scripts/coverage.sh", COVERAGE_SCRIPT.to_string()));
+    }
+
+    let mut planned = Vec::new();
+    for (rel, contents) in files {
+        let path = dir.join(rel);
+        let embedded = embed_hash_marker(rel, &contents);
+        let overwrites = path.exists();
+        planned.push(PlannedFile {
+            path: rel.to_string(),
+            size: embedded.len(),
+            overwrites,
+        });
+    }
+
+    Ok((info, planned))
+}
+
+/// Returns `(info, written, skipped)`: `skipped` (#344) lists files whose
+/// on-disk content had drifted from their last-generated hash marker and so
+/// were left alone under `--force` (use `--force-all` to overwrite them too).
+pub fn generate_with_options_layout(
+    dir: &Path,
+    options: &GenerateOptions,
+    layout: TestLayout,
+) -> Result<(ContractInfo, Vec<&'static str>, Vec<&'static str>)> {
+    let (info, files) = collect_planned_files(dir, options, layout)?;
+
+    let mut plan = Vec::new();
     let mut written = Vec::new();
     let mut skipped = Vec::new();
     for (rel, contents) in files {
         let path = dir.join(rel);
+        let embedded = embed_hash_marker(rel, &contents);
         let exists = path.exists();
-        if exists && !options.force && !options.force_all {
-            return Err(ForgeError::AlreadyExists(path));
-        }
-        // Issue #344: a file that exists under --force/--force-all might have
-        // been hand-edited since it was last generated. Only --force-all may
-        // clobber it; plain --force leaves it alone and reports it as skipped.
-        if exists && !options.force_all && was_hand_edited_since_generation(rel, &path) {
-            skipped.push(rel);
-            continue;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-        }
-        std::fs::write(&path, embed_hash_marker(rel, &contents))
-            .map_err(ForgeError::io(format!("writing {}", path.display())))?;
-    // Validate every target before writing any of them (issue #238): a file
-    // whose on-disk content already matches what generation would produce is
-    // left alone rather than rewritten or treated as a conflict — re-running
-    // test-init with unchanged inputs must converge on the same tree, not
-    // fail outright. A file that exists with *different* content (edited by
-    // the user, or stale from a contract that has since changed) still
-    // requires `--force`, and is refused here before anything is written, so
-    // a blocked run never leaves the tree half-updated.
-    let mut plan: Vec<(&'static str, String, bool)> = Vec::with_capacity(files.len());
-    for (rel, contents) in files {
-        let path = dir.join(rel);
-        let needs_write = if path.exists() {
+        if exists {
             let existing = std::fs::read_to_string(&path)
                 .map_err(ForgeError::io(format!("reading {}", path.display())))?;
-            if existing == contents {
-                false
-            } else if options.force {
-                true
-            } else {
+            if existing == embedded {
+                plan.push((rel, embedded, false));
+                continue;
+            }
+            if !options.force && !options.force_all {
                 return Err(ForgeError::AlreadyExists(path));
             }
+            if !options.force_all && was_hand_edited_since_generation(rel, &path) {
+                skipped.push(rel);
+                continue;
+            }
+            plan.push((rel, embedded, true));
         } else {
-            true
-        };
-        plan.push((rel, contents, needs_write));
+            plan.push((rel, embedded, true));
+        }
     }
 
-    let mut written = Vec::new();
-    for (rel, contents, needs_write) in plan {
+    for (rel, embedded, needs_write) in plan {
         if needs_write {
             let path = dir.join(rel);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
             }
-            std::fs::write(&path, contents)
+            std::fs::write(&path, embedded)
                 .map_err(ForgeError::io(format!("writing {}", path.display())))?;
         }
         written.push(rel);
@@ -2351,6 +2387,12 @@ impl ForgePlugin for TestgenPlugin {
                     .action(ArgAction::SetTrue)
                     .help("Generate an ignored integration test that deploys and invokes against a local Soroban network"),
             )
+            .arg(
+                Arg::new("dry-run")
+                    .long("dry-run")
+                    .action(ArgAction::SetTrue)
+                    .help("Print planned test files and their sizes without touching the filesystem"),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -2403,9 +2445,91 @@ impl ForgePlugin for TestgenPlugin {
             force_all: matches.get_flag("force-all"),
         };
         let fuzz = options.fuzz;
+        let dry_run = matches.get_flag("dry-run");
 
         // Workspace root: generate a harness per member.
         if is_workspace(&dir) {
+            if dry_run {
+                let members = workspace_members(&dir)?;
+                let mut planned_members = Vec::new();
+                for member_dir in members {
+                    let rel = member_dir
+                        .strip_prefix(&dir)
+                        .unwrap_or(&member_dir)
+                        .to_string_lossy()
+                        .into_owned();
+                    match plan_test_files(
+                        &member_dir,
+                        &options,
+                        layout,
+                        matches.get_flag("bench"),
+                        matches.get_flag("coverage"),
+                    ) {
+                        Ok((info, planned)) => {
+                            let overwritten: Vec<String> = planned
+                                .iter()
+                                .filter(|p| p.overwrites)
+                                .map(|p| p.path.clone())
+                                .collect();
+                            planned_members.push(serde_json::json!({
+                                "member": rel,
+                                "crate_name": info.crate_name,
+                                "planned_files": planned,
+                                "overwritten_files": overwritten,
+                                "skipped": false,
+                            }));
+                        }
+                        Err(e) => {
+                            planned_members.push(serde_json::json!({
+                                "member": rel,
+                                "skipped": true,
+                                "reason": e.to_string(),
+                            }));
+                        }
+                    }
+                }
+                if ctx.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "dry_run": true,
+                            "members": planned_members,
+                        }))
+                        .unwrap()
+                    );
+                } else if !ctx.quiet {
+                    println!("dry-run: planned test files for workspace at {}", dir.display());
+                    for m in &planned_members {
+                        if m["skipped"].as_bool().unwrap_or(false) {
+                            println!("\n  member `{}`: skipped ({})", m["member"].as_str().unwrap_or(""), m["reason"].as_str().unwrap_or(""));
+                        } else {
+                            println!("\n  member `{}` ({}):", m["member"].as_str().unwrap_or(""), m["crate_name"].as_str().unwrap_or(""));
+                            if let Some(files) = m["planned_files"].as_array() {
+                                for f in files {
+                                    let path = f["path"].as_str().unwrap_or("");
+                                    let size = f["size"].as_u64().unwrap_or(0);
+                                    let overwrites = if f["overwrites"].as_bool().unwrap_or(false) {
+                                        " [overwrites existing]"
+                                    } else {
+                                        ""
+                                    };
+                                    println!("    {path} ({size} bytes){overwrites}");
+                                }
+                            }
+                            if let Some(overwritten) = m["overwritten_files"].as_array() {
+                                if !overwritten.is_empty() {
+                                    println!("    overwritten files:");
+                                    for o in overwritten {
+                                        println!("      {}", o.as_str().unwrap_or(""));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
             let results = generate_workspace_with_options_layout(&dir, &options, layout)?;
             if ctx.json {
                 let members: Vec<serde_json::Value> = results
@@ -2433,6 +2557,55 @@ impl ForgePlugin for TestgenPlugin {
                 );
             } else if !ctx.quiet {
                 print!("{}", format_workspace_report(&results, fuzz));
+            }
+            return Ok(());
+        }
+
+        if dry_run {
+            let (info, planned) = plan_test_files(
+                &dir,
+                &options,
+                layout,
+                matches.get_flag("bench"),
+                matches.get_flag("coverage"),
+            )?;
+            let overwritten: Vec<String> = planned
+                .iter()
+                .filter(|p| p.overwrites)
+                .map(|p| p.path.clone())
+                .collect();
+
+            if ctx.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "dry_run": true,
+                        "crate_name": info.crate_name,
+                        "planned_files": planned,
+                        "overwritten_files": overwritten,
+                    }))
+                    .unwrap()
+                );
+            } else if !ctx.quiet {
+                println!(
+                    "dry-run: planned test files for `{}` at {}:",
+                    info.crate_name,
+                    dir.display()
+                );
+                for file in &planned {
+                    let overwrites = if file.overwrites {
+                        " [overwrites existing]"
+                    } else {
+                        ""
+                    };
+                    println!("  {} ({} bytes){}", file.path, file.size, overwrites);
+                }
+                if !overwritten.is_empty() {
+                    println!("\noverwritten files:");
+                    for f in &overwritten {
+                        println!("  {f}");
+                    }
+                }
             }
             return Ok(());
         }
@@ -2938,7 +3111,7 @@ impl VaultContract {
         let dir = tmp.path().join("demo");
         hello_world_project(&dir);
 
-        let (_, written_first) = generate(&dir, false, false).unwrap();
+        let (_, written_first, _) = generate(&dir, false, false).unwrap();
         let snapshot_before: Vec<(String, String)> = written_first
             .iter()
             .map(|rel| {
@@ -2949,7 +3122,7 @@ impl VaultContract {
             })
             .collect();
 
-        let (_, written_second) = generate(&dir, false, false)
+        let (_, written_second, _) = generate(&dir, false, false)
             .expect("re-running with unchanged inputs must not fail");
         assert_eq!(written_first, written_second, "same set of files, same order");
 
@@ -3834,5 +4007,105 @@ impl DemoContract {
         );
         assert!(report.contains("MAX_CPU_INSTRUCTIONS"), "{report}");
         assert!(report.contains("--nocapture"), "{report}");
+    }
+
+    // #237 — test-init --dry-run writes nothing and lists planned paths with sizes
+    #[test]
+    fn dry_run_writes_nothing_and_lists_planned_files_with_sizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        hello_world_project(&dir);
+
+        let options = GenerateOptions::default();
+        let (info, planned) = plan_test_files(&dir, &options, TestLayout::Tests, false, false).unwrap();
+
+        assert_eq!(info.crate_name, "demo");
+        assert!(!planned.is_empty(), "must have planned files");
+
+        for file in &planned {
+            assert!(file.size > 0, "file size must be greater than 0: {:?}", file);
+            assert!(!file.overwrites, "file must not overwrite non-existing file");
+            // Verify NO file was actually written to disk
+            assert!(
+                !dir.join(&file.path).exists(),
+                "dry-run must not write file to disk: {}",
+                file.path
+            );
+        }
+
+        // Expected files for hello_world
+        let paths: Vec<&str> = planned.iter().map(|p| p.path.as_str()).collect();
+        assert!(paths.contains(&"tests/common/mod.rs"));
+        assert!(paths.contains(&"tests/forge_smoke.rs"));
+        assert!(paths.contains(&"tests/forge_invariant.rs"));
+        assert!(paths.contains(&"tests/forge_snapshots.rs"));
+    }
+
+    // #237 — test-init --dry-run reports which existing files would be overwritten
+    #[test]
+    fn dry_run_reports_overwritten_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        hello_world_project(&dir);
+
+        // Pre-create tests/forge_smoke.rs
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/forge_smoke.rs"), "// existing content").unwrap();
+
+        let options = GenerateOptions::default();
+        let (_info, planned) = plan_test_files(&dir, &options, TestLayout::Tests, false, false).unwrap();
+
+        let smoke_file = planned.iter().find(|p| p.path == "tests/forge_smoke.rs").unwrap();
+        assert!(smoke_file.overwrites, "existing file must be marked as overwriting");
+
+        let common_file = planned.iter().find(|p| p.path == "tests/common/mod.rs").unwrap();
+        assert!(!common_file.overwrites, "non-existing file must not be marked as overwriting");
+
+        // Verify the pre-existing file content was untouched!
+        assert_eq!(
+            std::fs::read_to_string(dir.join("tests/forge_smoke.rs")).unwrap(),
+            "// existing content"
+        );
+    }
+
+    // #237 — test-init --dry-run honours --json and writes nothing
+    #[test]
+    fn dry_run_honours_json_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        hello_world_project(&dir);
+
+        let ctx = ForgeContext::with_options(
+            dir.clone(),
+            0,
+            false,
+            true, // json = true
+            false,
+            false,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let plugin = TestgenPlugin;
+        let cmd = plugin.command();
+        let matches = cmd
+            .try_get_matches_from(["test-init", "--dry-run", "--path", dir.to_str().unwrap()])
+            .unwrap();
+
+        let result = plugin.run(&matches, &ctx);
+        assert!(result.is_ok());
+
+        // Verify nothing was written to the directory
+        assert!(!dir.join("tests").exists(), "dry-run must not create tests directory");
+    }
+
+    // #237 — test-init command registers --dry-run flag
+    #[test]
+    fn dry_run_flag_is_registered() {
+        let cmd = TestgenPlugin.command();
+        let arg = cmd.get_arguments().find(|a| a.get_id() == "dry-run");
+        assert!(arg.is_some(), "--dry-run flag must be registered");
     }
 }

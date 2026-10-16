@@ -37,6 +37,7 @@ soroban-forge-init = { path = "crates/init" }
 soroban-forge-deploy = { path = "crates/deploy" }
 soroban-forge-invoke = { path = "crates/invoke" }
 soroban-forge-update-check = { path = "crates/update-check" }
+clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
 

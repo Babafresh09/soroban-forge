@@ -24,7 +24,9 @@ fn main() {
 
     // Intercept `completions <shell>` before full dispatch so we have access
     // to the complete clap `Command` tree (needed by clap_complete::generate).
-    if raw_args.get(1).map(String::as_str) == Some("completions") {
+    if raw_args.get(1).map(String::as_str) == Some("completions")
+        && !raw_args.iter().any(|a| a == "--help" || a == "-h")
+    {
         use clap_complete::{generate, shells};
 
         let shell_arg = raw_args.get(2).map(String::as_str).unwrap_or("");
@@ -54,7 +56,9 @@ fn main() {
     // Spawn the background version-check thread. It returns immediately.
     let update_handle = soroban_forge_update_check::spawn(offline, update_check_enabled);
     // Intercept `man [--out-dir DIR]` to generate man pages via clap_mangen.
-    if raw_args.get(1).map(String::as_str) == Some("man") {
+    if raw_args.get(1).map(String::as_str) == Some("man")
+        && !raw_args.iter().any(|a| a == "--help" || a == "-h")
+    {
         let out_dir = raw_args
             .windows(2)
             .find(|w| w[0] == "--out-dir")
@@ -120,7 +124,10 @@ fn generate_man_pages(cmd: &clap::Command, out_dir: &std::path::Path) {
     let filename = format!("{name}.1");
     let path = out_dir.join(&filename);
 
-    match clap_mangen::Man::new(cmd.clone()).render_to_file(&path) {
+    let render_res = std::fs::File::create(&path).and_then(|mut f| {
+        clap_mangen::Man::new(cmd.clone()).render(&mut f)
+    });
+    match render_res {
         Ok(()) => println!("wrote {}", path.display()),
         Err(e) => eprintln!("warning: could not write {}: {e}", path.display()),
     }
@@ -128,7 +135,7 @@ fn generate_man_pages(cmd: &clap::Command, out_dir: &std::path::Path) {
     for sub in cmd.get_subcommands() {
         // Rename subcommand to include the parent name so the man file is
         // `soroban-forge-new.1` rather than `new.1`.
-        let sub_name = format!("{name}-{}", sub.get_name());
+        let sub_name: &'static str = Box::leak(format!("{name}-{}", sub.get_name()).into_boxed_str());
         let renamed = sub.clone().name(sub_name);
         generate_man_pages(&renamed, out_dir);
     }

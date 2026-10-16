@@ -8,9 +8,7 @@
 
 use std::process::Command;
 
-/// Shape-valid contract ID (no real checksum) — enough to get past argument
-/// validation and reach the local-build lookup.
-const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const CONTRACT_ID: &str = "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE";
 
 #[test]
 fn verify_is_a_registered_subcommand() {

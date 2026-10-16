@@ -1873,6 +1873,10 @@ mod tests {
         assert_eq!(
             config_network_url(Some(&config)).as_deref(),
             Some("https://example.com/custom")
+        );
+    }
+
+    #[test]
     fn warns_when_project_sdk_is_behind_latest_published() {
         let dir = project_with_manifest(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"26.1.0\"\n",
@@ -1902,6 +1906,9 @@ mod tests {
             Some("my-private-net"),
             "an unknown name with no rpc_url has nothing else to fall back to"
         );
+    }
+
+    #[test]
     fn falls_back_to_template_pin_when_registry_is_unavailable() {
         let dir = project_with_manifest(&format!(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"{SOROBAN_SDK_VERSION}\"\n",
@@ -2084,7 +2091,7 @@ mod tests {
                 "install the wasm32v1-none target via your system package manager or the Rust distribution you installed; rustup is not available on PATH"
             )
         );
-        assert!(!fix.unwrap().contains("rustup"));
+        assert!(!fix.unwrap().contains("rustup target add"));
     }
 
     #[test]
@@ -2156,6 +2163,9 @@ mod tests {
     fn lockfile_present_and_not_ignored_passes() {
         let check = classify_cargo_lock(true, LockIgnored::No);
         assert_eq!(check.status, Status::Pass);
+        assert!(check.fix.is_none());
+    }
+
     // ---- disk space check ----
 
     #[test]
@@ -2185,6 +2195,10 @@ mod tests {
         // suggests version control would drop it.
         let check = classify_cargo_lock(true, LockIgnored::Unknown);
         assert_eq!(check.status, Status::Pass);
+        assert!(check.fix.is_none());
+    }
+
+    #[test]
     fn disk_space_reports_pass_at_exact_threshold() {
         let check = classify_disk_space(Some(MIN_FREE_DISK_SPACE_BYTES), MIN_FREE_DISK_SPACE_BYTES);
         assert_eq!(check.status, Status::Pass);
@@ -2268,6 +2282,9 @@ mod tests {
         // `cargo generate-lockfile` is safe to run, but committing the result
         // is the user's call — so this is reported, never auto-fixed.
         assert!(remedy(&fail("Cargo.lock")).is_none());
+    }
+
+    #[test]
     fn disk_space_reports_warn_when_below_threshold() {
         let check = classify_disk_space(Some(500 * 1024 * 1024), MIN_FREE_DISK_SPACE_BYTES);
         assert_eq!(check.status, Status::Warn);

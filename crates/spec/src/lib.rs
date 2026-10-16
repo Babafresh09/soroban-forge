@@ -1026,6 +1026,7 @@ pub fn dump_interface_from_wasm(
     let result = match format {
         SpecFormat::Rust => run_stellar_info(wasm, SpecFormat::Rust, timeout)?,
         SpecFormat::Json => run_stellar_info(wasm, SpecFormat::Json, timeout)?,
+        SpecFormat::Xdr => run_stellar_info(wasm, SpecFormat::Xdr, timeout)?,
         SpecFormat::Markdown => {
             let json_str = run_stellar_info(wasm, SpecFormat::Json, timeout)?;
             // Cache the intermediate JSON (not the rendered Markdown)
@@ -1112,6 +1113,9 @@ pub fn format_single_entrypoint(entry: &serde_json::Value, format: SpecFormat) -
         SpecFormat::Json => Ok(serde_json::to_string_pretty(entry)
             .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
             + "\n"),
+        SpecFormat::Xdr => Err(ForgeError::InvalidArgument(
+            "single entrypoint filtering is not supported for xdr format".into(),
+        )),
         SpecFormat::Rust | SpecFormat::Markdown => {
             // Re-wrap as a one-element array so `render_markdown_spec` and
             // the Rust listing path both work without modification.
@@ -2173,6 +2177,8 @@ mod tests {
         assert!(msg.contains("timed out"), "{msg}");
         assert!(msg.contains("--timeout"), "{msg}");
         assert!(msg.contains("demo.wasm"), "{msg}");
+    }
+
     #[test]
     fn markdown_tables_escape_pipes_and_backticks_in_identifiers() {
         // Contract-supplied names are untrusted input (#483): a literal `|` adds
@@ -2255,6 +2261,8 @@ mod tests {
         assert!(md.contains(r"pip\|e"));
         assert!(md.contains(r"fie\|ld"));
         assert!(md.contains(r"back\`tick"));
+    }
+
     // #403 — spec --out: command must expose --out and --force flags
     #[test]
     fn command_exposes_out_and_force_flags() {

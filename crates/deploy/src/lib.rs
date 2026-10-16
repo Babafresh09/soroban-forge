@@ -15,7 +15,7 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use soroban_forge_core::{ForgeContext, ForgeError, ForgePlugin, Result};
 
 /// Network used when neither `--network` nor `--rpc-url` is given.
@@ -168,6 +168,12 @@ impl NetworkArgs {
     }
 }
 
+pub fn build_stellar_build_args(extra_args: &[String]) -> Vec<String> {
+    let mut args = vec!["contract".to_string(), "build".to_string()];
+    args.extend_from_slice(extra_args);
+    args
+}
+
 fn path_str(path: &Path) -> Result<&str> {
     path.to_str().ok_or_else(|| ForgeError::Other(format!(
         "wasm path {} is not valid UTF-8; normal deployment passes native OS paths directly to stellar-cli, \
@@ -291,6 +297,10 @@ pub fn parse_constructor_arg(raw: &str) -> Result<(String, String)> {
     Ok((name.to_string(), raw[eq + 1..].to_string()))
 }
 
+pub fn parse_constructor_args(raw: &[String]) -> Result<Vec<(String, String)>> {
+    raw.iter().map(|s| parse_constructor_arg(s)).collect()
+}
+
 /// Assemble the full `stellar contract deploy` argument list, optionally
 /// including constructor arguments forwarded after `--`.
 pub fn build_deploy_args(wasm: &Path, source: &str, network: &NetworkArgs) -> Result<Vec<String>> {
@@ -316,6 +326,10 @@ pub fn build_deploy_args_with_alias(
         "--output".to_string(),
         "json".to_string(),
     ];
+    if let Some(alias) = alias {
+        args.push("--alias".to_string());
+        args.push(alias.to_string());
+    }
     args.extend(network.cli_args());
     Ok(args)
 }
@@ -338,10 +352,6 @@ pub fn build_upgrade_args(
         "--source".to_string(),
         source.to_string(),
     ];
-    if let Some(alias) = alias {
-        args.push("--alias".to_string());
-        args.push(alias.to_string());
-    }
     args.extend(network.cli_args());
     Ok(args)
 }
@@ -379,6 +389,7 @@ fn run_stellar_deploy(
 ) -> Result<String> {
     log::debug!("deploying {}", wasm.display());
 
+    let args = build_deploy_args_with_constructor(wasm, source, network, constructor_args)?;
     let mut command = std::process::Command::new("stellar");
     command.args(&args);
     let result = if verbose {
@@ -442,7 +453,7 @@ pub fn deploy(
     constructor_args: &[(String, String)],
     timeout: Option<Duration>,
 ) -> Result<String> {
-    deploy_with_output(dir, wasm_override, source, network, timeout, false)
+    deploy_with_output(dir, wasm_override, source, network, constructor_args, timeout, false)
 }
 
 fn deploy_with_output(
@@ -450,11 +461,12 @@ fn deploy_with_output(
     wasm_override: Option<&Path>,
     source: &str,
     network: &NetworkArgs,
+    constructor_args: &[(String, String)],
     timeout: Option<Duration>,
     verbose: bool,
 ) -> Result<String> {
     let wasm_path = build_if_needed_with_output(dir, wasm_override, verbose)?;
-    run_stellar_deploy(&wasm_path, source, network, timeout, verbose)
+    run_stellar_deploy(&wasm_path, source, network, constructor_args, timeout, verbose)
 }
 
 fn run_stellar_upgrade(
@@ -566,6 +578,29 @@ pub fn resolve_source_public_key(source: &str) -> Option<String> {
     None
 }
 
+/// Read the default identity set via `soroban-forge identity use <name>`.
+pub fn default_identity_from_store() -> Option<String> {
+    let config_dir = dirs::config_dir()?;
+    let path = config_dir.join("soroban-forge").join("identities.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let val = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    val.get("default")?.as_str().map(String::from)
+}
+
+/// Resolve the source identity to use: CLI override -> config identity.default -> identities.json default.
+pub fn resolve_source_identity(
+    cli_source: Option<&str>,
+    config: Option<&soroban_forge_core::config::ForgeConfig>,
+) -> Option<String> {
+    if let Some(s) = cli_source {
+        return Some(s.to_string());
+    }
+    if let Some(cfg_default) = config.and_then(|c| c.identity.default.as_ref()) {
+        return Some(cfg_default.clone());
+    }
+    default_identity_from_store()
+}
+
 /// Return the closest locally managed identity name, if the source looks like
 /// a near miss. This is advisory only: identities managed by stellar-cli must
 /// still be allowed through to the underlying command.
@@ -577,10 +612,8 @@ fn source_identity_suggestion(source: &str) -> Option<String> {
     let config_dir = dirs::config_dir()?;
     let path = config_dir.join("soroban-forge").join("identities.json");
     let raw = std::fs::read_to_string(path).ok()?;
-    let identities = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()?
-        .get("identities")?
-        .as_object()?;
+    let val = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let identities = val.get("identities")?.as_object()?;
     if identities.contains_key(source) {
         return None;
     }
@@ -867,7 +900,7 @@ fn unix_secs_to_ymdhms(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     (y, mo, d, h, mi, s)
 }
 
-fn days_to_ymd(mut days: u32) -> (u32, u32, u32) {
+fn days_to_ymd(days: u32) -> (u32, u32, u32) {
     // Algorithm: civil_from_days by Howard Hinnant (public domain).
     let z = days + 719_468;
     let era = z / 146_097;
@@ -963,6 +996,33 @@ impl ForgePlugin for DeployPlugin {
                     .value_name("CONTRACT_ID")
                     .help("Upgrade this existing contract instead of creating a new one"),
             )
+            .arg(
+                Arg::new("arg")
+                    .long("arg")
+                    .value_name("NAME=VALUE")
+                    .action(clap::ArgAction::Append)
+                    .help("Pass a constructor argument as NAME=VALUE (repeatable)"),
+            )
+            .arg(
+                Arg::new("no-record")
+                    .long("no-record")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Skip appending this deployment to deployments.json"),
+            )
+            .arg(
+                Arg::new("build-arg")
+                    .long("build-arg")
+                    .value_name("ARG")
+                    .action(clap::ArgAction::Append)
+                    .allow_hyphen_values(true)
+                    .help("Forward one argument to stellar contract build (repeatable, e.g. --build-arg=--features)"),
+            )
+            .arg(
+                Arg::new("alias")
+                    .long("alias")
+                    .value_name("NAME")
+                    .help("Register the deployed contract under this stellar-cli alias"),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -983,21 +1043,23 @@ impl ForgePlugin for DeployPlugin {
             .map(|p| ctx.cwd.join(p))
             .unwrap_or_else(|| ctx.cwd.clone());
         let wasm_override = matches.get_one::<String>("wasm").map(|p| ctx.cwd.join(p));
-        let source = matches
-            .get_one::<String>("source")
-            .cloned()
-            .or_else(|| {
-                ctx.config
-                    .as_ref()
-                    .and_then(|config| config.identity.default.clone())
-            })
-            .ok_or_else(|| {
-                ForgeError::InvalidArgument(
-                    "missing source identity: pass --source or set [identity].default in config"
-                        .into(),
-                )
-            })?;
+        let source = resolve_source_identity(
+            matches.get_one::<String>("source").map(String::as_str),
+            ctx.config.as_ref(),
+        )
+        .ok_or_else(|| {
+            ForgeError::InvalidArgument(
+                "missing source identity: pass --source or set a default identity (via `soroban-forge identity use <name>` or [identity].default in config)"
+                    .into(),
+            )
+        })?;
         let upgrade_contract_id = matches.get_one::<String>("upgrade");
+        let constructor_args = parse_constructor_args(
+            &matches
+                .get_many::<String>("arg")
+                .map(|vals| vals.cloned().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        )?;
 
         if let Some(suggestion) = source_identity_suggestion(&source) {
             if !ctx.quiet && !ctx.json {
@@ -1023,7 +1085,7 @@ impl ForgePlugin for DeployPlugin {
             let wasm_path = build_if_needed(&dir, wasm_override.as_deref())?;
             let args = match upgrade_contract_id {
                 Some(contract_id) => build_upgrade_args(contract_id, &wasm_path, &source, &network)?,
-                None => build_deploy_args(&wasm_path, &source, &network)?,
+                None => build_deploy_args_with_constructor(&wasm_path, &source, &network, &constructor_args)?,
             };
             let command_line = format_dry_run_command("stellar", &args);
             if ctx.json {
@@ -1067,9 +1129,21 @@ impl ForgePlugin for DeployPlugin {
             wasm_override.as_deref(),
             &source,
             &network,
+            &constructor_args,
             ctx.timeout(),
             ctx.verbose > 0,
         )?;
+
+        // Record the deployment unless --no-record was passed.
+        if !no_record {
+            let crate_name = read_crate_name(&dir).unwrap_or_else(|_| "unknown".to_string());
+            let deployments_file = deployments_path(&dir);
+            if let Err(e) =
+                DeploymentsFile::record_and_save(&deployments_file, &crate_name, &network.label(), &contract_id)
+            {
+                log::warn!("could not write deployments file: {e}");
+            }
+        }
 
         if ctx.json {
             let report = serde_json::json!({
@@ -1623,5 +1697,34 @@ mod tests {
     fn help_documents_no_record_flag() {
         let help = DeployPlugin.command().render_long_help().to_string();
         assert!(help.contains("--no-record"), "{help}");
+    }
+
+    // #427 — resolve_source_identity picks up config default identity when --source is omitted
+    #[test]
+    fn test_resolve_source_identity_picks_up_default_from_config() {
+        let mut config = soroban_forge_core::config::ForgeConfig::default();
+        config.identity.default = Some("alice".into());
+
+        let resolved = resolve_source_identity(None, Some(&config));
+        assert_eq!(resolved, Some("alice".to_string()));
+    }
+
+    // #427 — resolve_source_identity prioritizes explicit CLI --source over config default
+    #[test]
+    fn test_resolve_source_identity_cli_override_takes_precedence() {
+        let mut config = soroban_forge_core::config::ForgeConfig::default();
+        config.identity.default = Some("alice".into());
+
+        let resolved = resolve_source_identity(Some("bob"), Some(&config));
+        assert_eq!(resolved, Some("bob".to_string()));
+    }
+
+    // #427 — deploy --source flag is optional
+    #[test]
+    fn test_deploy_command_source_flag_is_optional() {
+        let plugin = DeployPlugin;
+        let cmd = plugin.command();
+        let matches = cmd.try_get_matches_from(["deploy", "--dry-run"]);
+        assert!(matches.is_ok(), "deploy must parse without --source");
     }
 }

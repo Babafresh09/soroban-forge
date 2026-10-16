@@ -49,8 +49,9 @@ pub fn well_known(name: &str) -> Option<Network> {
             network_passphrase: "Test SDF Future Network ; October 2022".into(),
         }),
         // #289 — official Stellar mainnet
+        // #466 — official public RPC endpoint without embedded credentials
         "mainnet" => Some(Network {
-            rpc_url: "https://mainnet.stellar.validationcloud.io/v1/xycnx8vsxlflkqfe5zuek5lgq".into(),
+            rpc_url: "https://mainnet.sorobanrpc.com".into(),
             // Canonical mainnet passphrase
             network_passphrase: "Public Global Stellar Network ; September 2015".into(),
         }),
@@ -65,9 +66,13 @@ pub fn well_known(name: &str) -> Option<Network> {
 /// Return the path to the network store file.
 /// `~/.config/soroban-forge/networks.json`
 pub fn store_path() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| {
-        ForgeError::Other("could not determine user config directory".into())
-    })?;
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+        .ok_or_else(|| {
+            ForgeError::Other("could not determine user config directory".into())
+        })?;
     Ok(config_dir.join("soroban-forge").join("networks.json"))
 }
 
@@ -645,6 +650,25 @@ mod tests {
 
         assert!(well_known("localnet").is_some());
         assert!(well_known("custom-xyz").is_none());
+    }
+
+    // #466 — mainnet preset must not contain embedded credentials or API keys
+    #[test]
+    fn test_mainnet_rpc_url_has_no_embedded_credential() {
+        let mainnet = well_known("mainnet").expect("mainnet should be a built-in");
+        let url = &mainnet.rpc_url;
+        assert!(!url.contains("validationcloud"), "must not use third-party paid provider");
+        assert!(!url.contains('?'), "URL must not contain query string credential");
+        assert!(!url.contains('@'), "URL must not contain userinfo credential");
+        // Ensure path segments don't look like embedded API tokens/keys
+        let after_scheme = url.split("://").nth(1).unwrap_or(url);
+        let segments: Vec<&str> = after_scheme.split('/').skip(1).filter(|s| !s.is_empty()).collect();
+        for segment in segments {
+            assert!(
+                segment.len() < 20,
+                "path segment `{segment}` looks like an embedded API credential"
+            );
+        }
     }
 
     // #289 — built-ins are available via resolve_network without user configuration

@@ -518,7 +518,7 @@ impl ForgePlugin for InvokePlugin {
             )
             .arg(
                 Arg::new("function")
-                    .required(true)
+                    .required(false)
                     .value_name("FN")
                     .help("Name of the contract function to call"),
             )
@@ -535,7 +535,7 @@ impl ForgePlugin for InvokePlugin {
                     .long("source")
                     .short('s')
                     .value_name("IDENTITY")
-                    .help("Source account/identity that signs the invocation [default: config identity.default]"),
+                    .help("Source account/identity that signs the invocation [default: config identity.default or default identity]"),
             )
             .arg(
                 Arg::new("network")
@@ -599,14 +599,17 @@ impl ForgePlugin for InvokePlugin {
         );
 
         // Issue #281: fall back to the recorded contract ID when none is given.
-        let contract_id = match matches.get_one::<String>("contract-id") {
-            Some(id) => id.clone(),
-            None => {
+        let (contract_id, function) = match (
+            matches.get_one::<String>("contract-id"),
+            matches.get_one::<String>("function"),
+        ) {
+            (Some(id), Some(func)) => (id.clone(), func.clone()),
+            (Some(only_arg), None) => {
                 let dir = matches
                     .get_one::<String>("path")
                     .map(|p| ctx.cwd.join(p))
                     .unwrap_or_else(|| ctx.cwd.clone());
-                soroban_forge_deploy::lookup_recorded_contract_id(
+                let id = soroban_forge_deploy::lookup_recorded_contract_id(
                     &dir,
                     &soroban_forge_deploy::read_crate_name(&dir).unwrap_or_default(),
                     &network.network.clone().unwrap_or_else(|| DEFAULT_NETWORK.to_string()),
@@ -617,32 +620,30 @@ impl ForgePlugin for InvokePlugin {
                          run `soroban-forge deploy` first or pass a contract ID explicitly"
                             .into(),
                     )
-                })?
+                })?;
+                (id, only_arg.clone())
+            }
+            (None, _) => {
+                return Err(ForgeError::InvalidArgument(
+                    "missing function name to call".into(),
+                ));
             }
         };
-
-        let function = matches
-            .get_one::<String>("function")
-            .expect("function is required by clap");
         let inline_args: Vec<String> = matches
             .get_many::<String>("args")
             .unwrap_or_default()
             .cloned()
             .collect();
-        let source = matches
-            .get_one::<String>("source")
-            .cloned()
-            .or_else(|| {
-                ctx.config
-                    .as_ref()
-                    .and_then(|config| config.identity.default.clone())
-            })
-            .ok_or_else(|| {
-                ForgeError::InvalidArgument(
-                    "missing source identity: pass --source or set [identity].default in config"
-                        .into(),
-                )
-            })?;
+        let source = soroban_forge_deploy::resolve_source_identity(
+            matches.get_one::<String>("source").map(String::as_str),
+            ctx.config.as_ref(),
+        )
+        .ok_or_else(|| {
+            ForgeError::InvalidArgument(
+                "missing source identity: pass --source or set a default identity (via `soroban-forge identity use <name>` or [identity].default in config)"
+                    .into(),
+            )
+        })?;
 
         // Issue #284: merge --args-file with inline args (inline wins).
         let fn_args = if let Some(args_path) = matches.get_one::<String>("args-file") {
@@ -659,7 +660,7 @@ impl ForgePlugin for InvokePlugin {
                 &contract_id,
                 &source,
                 &network,
-                function,
+                &function,
                 &fn_args,
                 &ctx.cwd,
                 ctx.timeout(),
@@ -715,7 +716,7 @@ impl ForgePlugin for InvokePlugin {
                 &contract_id,
                 &source,
                 &network,
-                function,
+                &function,
                 &fn_args,
                 &ctx.cwd,
                 ctx.timeout(),
@@ -732,7 +733,7 @@ impl ForgePlugin for InvokePlugin {
                 &contract_id,
                 &source,
                 &network,
-                function,
+                &function,
                 &fn_args,
                 &ctx.cwd,
                 ctx.timeout(),
@@ -1112,5 +1113,19 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(matches.get_one::<String>("args-file").unwrap(), "args.json");
+    }
+
+    // #427 — invoke --source flag is optional
+    #[test]
+    fn test_invoke_command_source_flag_is_optional() {
+        let matches = InvokePlugin
+            .command()
+            .try_get_matches_from([
+                "invoke",
+                "--simulate",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "get_balance",
+            ]);
+        assert!(matches.is_ok(), "invoke must parse without --source");
     }
 }
