@@ -13,7 +13,7 @@ List them at any time with `soroban-forge templates`:
 - `dutch-auction` – descending-price auction with linear price decay and immediate settlement
 - `escrow` – token escrow with approval or timeout-based refund path
 - `flash-loan` – uncollateralized single-transaction loan repaid via a borrower callback
-- `governance` – DAO governance with weighted voting, quorum, and proposal execution
+- `governance` – DAO governance with one-member-one-vote, quorum, and proposal execution
 - `hello-world` – minimal greeter contract (recommended starting point)
 - `multisig` – M-of-N multisig account contract (`CustomAccountInterface`)
 - `nft` – NFT with per-token metadata and minting
@@ -89,7 +89,7 @@ description; `soroban-forge new <name> --template <t>` scaffolds one.
 | `amm`              | constant-product AMM / liquidity pool (`x*y=k`, 0.3% fee)         |
 | `atomic-swap`      | atomic two-party token swap with dual authorization              |
 | `flash-loan`       | uncollateralized loan repaid inside one transaction              |
-| `governance`       | DAO governance with weighted voting, quorum and execution        |
+| `governance`       | DAO governance with one-member-one-vote, quorum and execution    |
 | `multisig`         | M-of-N multisig account contract (`CustomAccountInterface`)      |
 | `yield-vault`      | ERC4626-style yield vault with vault-favoured rounding           |
 | `prediction-market`| binary outcome market with oracle resolution and parimutuel payouts |

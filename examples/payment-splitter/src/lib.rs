@@ -1,6 +1,8 @@
 //! Payment splitter — distributes received funds to payees by fixed shares.
 //!
-//! Payees and their shares are fixed at initialization. Every deposit is
+//! Payees and their shares are fixed at initialization, which can only run
+//! once — afterwards nobody, including the deployer, can rewrite the payee
+//! table. Every deposit is
 //! credited to the pool, and each payee can withdraw their proportional cut
 //! at any time:
 //!
@@ -47,9 +49,19 @@ impl PaymentSplitterContract {
     /// * `payees` — addresses receiving a cut, in any order
     /// * `shares` — share count per payee, positionally matching `payees`
     ///
-    /// Panics when the two vectors differ in length, when `payees` is empty,
-    /// when a payee appears twice, or when any share is zero.
+    /// Panics when the splitter is already initialized, when the two vectors
+    /// differ in length, when `payees` is empty, when a payee appears twice,
+    /// or when any share is zero.
+    ///
+    /// Runs once. Re-running it would replace `Payees`/`TotalShares` and reset
+    /// `TotalReceived` while old payees' `Shares`/`Released` entries stayed
+    /// behind, so funds already deposited would become unaccounted for.
+    /// Deploy and initialize in the same transaction (or move this into a
+    /// `__constructor`) so nobody can front-run the first call.
     pub fn initialize(env: Env, token: Address, payees: Vec<Address>, shares: Vec<u32>) {
+        if env.storage().instance().has(&DataKey::Token) {
+            panic!("already initialized");
+        }
         if payees.is_empty() {
             panic!("at least one payee is required");
         }

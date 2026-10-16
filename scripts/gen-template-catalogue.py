@@ -35,7 +35,7 @@ WHEN_TO_PICK = {
     "escrow": "a single buyer/seller trade that needs an approval-or-timeout release path, without building a marketplace",
     "faucet": "testnet/devnet token distribution with a per-address cooldown, e.g. for demos or QA environments",
     "flash-loan": "uncollateralized same-transaction borrowing, or as a reference for writing a callback-repaid pool",
-    "governance": "on-chain DAO decisions that need weighted voting, quorum, and automatic execution of the winning proposal",
+    "governance": "on-chain DAO decisions by a known set of members, with one vote each, quorum, and automatic execution of the winning proposal",
     "hello-world": "your very first soroban-forge project, or a clean slate before writing real contract logic",
     "lottery": "on-chain randomness where no single party (including the drawer) should be able to bias the outcome",
     "merkle-airdrop": "distributing tokens to a large, fixed allowlist without storing every address on-chain",

@@ -21,7 +21,7 @@ for the template format and how to add a new one.
 - `dutch-auction` — descending-price auction with linear price decay
 - `escrow` — token escrow with approval or timeout-based refund
 - `faucet` — token faucet with per-address cooldown
-- `governance` — DAO governance with weighted voting and quorum
+- `governance` — DAO governance with one-member-one-vote and quorum
 - `lottery` — randomized lottery with ticket purchases and prize draws
 - `merkle-airdrop` — one-claim-per-address airdrop verified against a merkle root
 - `multisig` — M-of-N multisig account contract

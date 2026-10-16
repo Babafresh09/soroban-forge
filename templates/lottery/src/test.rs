@@ -124,3 +124,40 @@ fn enter_after_commit_deadline_fails() {
     env.ledger().with_mut(|li| li.timestamp = commit_deadline);
     contract.enter(&alice, &commit(&env, &nonce_a));
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn initialize_twice_fails_after_a_commit() {
+    let env = Env::default();
+    let (contract, _admin, commit_deadline, reveal_deadline) = setup(&env);
+
+    let alice = Address::generate(&env);
+    let nonce_a = BytesN::from_array(&env, &[1_u8; 32]);
+    contract.enter(&alice, &commit(&env, &nonce_a));
+
+    // An attacker tries to take over and reset the running lottery.
+    let attacker = Address::generate(&env);
+    contract.initialize(&attacker, &(commit_deadline + 10), &(reveal_deadline + 10));
+}
+
+#[test]
+fn initialize_twice_fails_after_a_completed_draw_and_keeps_the_winner() {
+    let env = Env::default();
+    let (contract, _admin, commit_deadline, reveal_deadline) = setup(&env);
+
+    let alice = Address::generate(&env);
+    let nonce_a = BytesN::from_array(&env, &[1_u8; 32]);
+    contract.enter(&alice, &commit(&env, &nonce_a));
+    env.ledger().with_mut(|li| li.timestamp = commit_deadline);
+    contract.reveal(&alice, &nonce_a);
+    env.ledger().with_mut(|li| li.timestamp = reveal_deadline);
+    let winner = contract.draw();
+
+    let attacker = Address::generate(&env);
+    let result = contract.try_initialize(&attacker, &(reveal_deadline + 100), &(reveal_deadline + 200));
+    assert!(result.is_err(), "a finished lottery must not be re-initializable");
+
+    // The draw outcome is untouched and cannot be re-run.
+    assert_eq!(contract.get_winner(), winner);
+    assert!(contract.try_draw().is_err());
+}

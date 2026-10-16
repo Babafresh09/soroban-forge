@@ -181,3 +181,38 @@ fn mismatched_payees_and_shares_are_rejected() {
 
     contract.initialize(&token.address, &payees, &shares);
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn second_initialize_is_rejected() {
+    let env = Env::default();
+    let f = setup(&env, &[1, 1], 1);
+    let mut payees = Vec::new(&env);
+    payees.push_back(Address::generate(&env));
+    let mut shares = Vec::new(&env);
+    shares.push_back(1_u32);
+    f.contract.initialize(&f.token.address, &payees, &shares);
+}
+
+#[test]
+fn second_initialize_cannot_rewrite_payees_or_reset_deposits() {
+    let env = Env::default();
+    let f = setup(&env, &[3, 1], 1_000);
+    f.contract.deposit(&f.funder, &400);
+
+    // An attacker tries to install themselves as the only payee.
+    let attacker = Address::generate(&env);
+    let mut payees = Vec::new(&env);
+    payees.push_back(attacker.clone());
+    let mut shares = Vec::new(&env);
+    shares.push_back(100_u32);
+    let result = f.contract.try_initialize(&f.token.address, &payees, &shares);
+    assert!(result.is_err());
+
+    // Everything is exactly as configured the first time.
+    assert_eq!(f.contract.payees(), f.payees);
+    assert_eq!(f.contract.total_shares(), 4);
+    assert_eq!(f.contract.total_received(), 400);
+    assert_eq!(f.contract.earned(&f.payees.get_unchecked(0)), 300);
+    assert!(f.contract.try_shares(&attacker).is_err(), "attacker must not be a payee");
+}
