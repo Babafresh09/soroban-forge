@@ -105,6 +105,17 @@ scaffolding.
   contract's wasm hash with the local release build; exits `1` on a mismatch.
   See [Contract Verification](contract-verification.md).
 
+- `soroban-forge identity import <name> (--secret <S...> | --secret-stdin) [--force]` —
+  register an existing Stellar keypair (e.g. a CI secret or a key generated
+  elsewhere). The public key is derived from the secret, which must be a valid
+  `S...` strkey; malformed keys are rejected without being echoed. An existing
+  name needs `--force`, exactly like `identity generate`. Prefer
+  `--secret-stdin` (`echo "$SECRET" | soroban-forge identity import ci --secret-stdin`)
+  so the key stays out of shell history.
+- `soroban-forge identity show <name> [--reveal-secret]` — print a stored
+  identity's public key. The secret key is printed only with the explicit
+  `--reveal-secret` flag (also in `--json`); `show` and `list` never print
+  secrets by default.
 - `soroban-forge deploy [--source <name|pubkey>] [--network <n>] [--rpc-url <url>] [--fund] [--dry-run]` — deploy
   a built contract to a network.
   - `--source <name>` — the identity or public key used to sign and pay for deployment.

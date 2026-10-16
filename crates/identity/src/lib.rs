@@ -1,7 +1,7 @@
 //! # soroban-forge-identity
 //!
-//! `soroban-forge identity generate|list|fund|remove` — manage test keypairs
-//! and fund them via friendbot on testnet.
+//! `soroban-forge identity generate|import|list|show|fund|remove` — manage
+//! test keypairs and fund them via friendbot on testnet.
 //!
 //! Identities are stored as a JSON file at
 //! `~/.config/soroban-forge/identities.json`.
@@ -87,6 +87,88 @@ pub fn generate_keypair() -> (String, String) {
     let public = PublicKey(pubkey).to_string();
     let secret = PrivateKey(seed).to_string();
     (public, secret)
+}
+
+/// Derive the public key (`G...`) from a Stellar secret key (`S...`) (#421).
+///
+/// Rejects anything that is not a well-formed ed25519 secret-seed strkey
+/// (wrong prefix, bad base32, bad length or checksum). The error never echoes
+/// the input, so a mistyped secret does not end up in logs or scrollback.
+pub fn public_key_from_secret(secret: &str) -> Result<String> {
+    use ed25519_dalek::SigningKey;
+    use stellar_strkey::ed25519::{PrivateKey, PublicKey};
+
+    let seed = PrivateKey::from_string(secret.trim()).map_err(|_| {
+        ForgeError::InvalidArgument(
+            "not a valid Stellar secret key: expected a 56-character strkey starting with `S`".into(),
+        )
+    })?;
+    let signing_key = SigningKey::from_bytes(&seed.0);
+    Ok(PublicKey(signing_key.verifying_key().to_bytes()).to_string())
+}
+
+/// Add an existing keypair to `store` under `name` (#421).
+///
+/// Validates the secret and derives its public key; a name collision is an
+/// [`ForgeError::AlreadyExists`] unless `force`, exactly like `generate`.
+pub fn import_identity(
+    store: &mut IdentityStore,
+    name: &str,
+    secret: &str,
+    force: bool,
+) -> Result<Identity> {
+    if store.identities.contains_key(name) && !force {
+        return Err(ForgeError::AlreadyExists(PathBuf::from(name)));
+    }
+    let public_key = public_key_from_secret(secret)?;
+    let identity = Identity {
+        public_key,
+        secret_key: secret.trim().to_string(),
+    };
+    store.identities.insert(name.to_string(), identity.clone());
+    Ok(identity)
+}
+
+/// Text shown by `identity show` (#422). The secret key is printed only when
+/// `reveal_secret` is set; otherwise it is masked, consistent with
+/// `generate` and `list`.
+pub fn format_show(name: &str, identity: &Identity, reveal_secret: bool) -> String {
+    let secret = if reveal_secret {
+        identity.secret_key.as_str()
+    } else {
+        "[redacted — pass --reveal-secret to reveal]"
+    };
+    format!(
+        "identity `{name}`\n  public key: {}\n  secret key: {secret}\n",
+        identity.public_key
+    )
+}
+
+/// JSON shown by `identity show --json` (#422); `secret_key` only on request.
+pub fn show_json(name: &str, identity: &Identity, reveal_secret: bool) -> serde_json::Value {
+    let mut report = serde_json::json!({
+        "name": name,
+        "public_key": identity.public_key,
+    });
+    if reveal_secret {
+        report["secret_key"] = serde_json::Value::String(identity.secret_key.clone());
+    }
+    report
+}
+
+/// Read a secret from the first line of `reader` (`identity import --secret-stdin`).
+fn read_secret_line(mut reader: impl std::io::BufRead) -> Result<String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(ForgeError::io("reading secret key from stdin"))?;
+    let secret = line.trim().to_string();
+    if secret.is_empty() {
+        return Err(ForgeError::InvalidArgument(
+            "no secret key on stdin (pipe one in, e.g. `echo \"$STELLAR_SECRET\" | soroban-forge identity import ci --secret-stdin`)".into(),
+        ));
+    }
+    Ok(secret)
 }
 
 /// GET `url`, bounded by `timeout` when one is set (`--timeout`).
@@ -251,6 +333,55 @@ impl ForgePlugin for IdentityPlugin {
                     ),
             )
             .subcommand(
+                Command::new("import")
+                    .about("Register an existing Stellar keypair under a name, from its secret key")
+                    .long_about(
+                        "Store an existing keypair (e.g. a CI secret or a key generated elsewhere). \
+                         The public key is derived from the secret, which must be a valid `S...` strkey. \
+                         Prefer --secret-stdin over --secret so the key does not end up in shell history.",
+                    )
+                    .arg(
+                        Arg::new("name")
+                            .help("Name for the identity (e.g. ci, deployer)")
+                            .required(true),
+                    )
+                    .arg(
+                        Arg::new("secret")
+                            .long("secret")
+                            .value_name("SECRET_KEY")
+                            .help("The secret key (S...) to import")
+                            .conflicts_with("secret-stdin")
+                            .required_unless_present("secret-stdin"),
+                    )
+                    .arg(
+                        Arg::new("secret-stdin")
+                            .long("secret-stdin")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Read the secret key from the first line of stdin instead"),
+                    )
+                    .arg(
+                        Arg::new("force")
+                            .long("force")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Overwrite an existing identity with the same name"),
+                    ),
+            )
+            .subcommand(
+                Command::new("show")
+                    .about("Show a stored identity (secret key only with --reveal-secret)")
+                    .arg(
+                        Arg::new("name")
+                            .help("Name of the identity to show")
+                            .required(true),
+                    )
+                    .arg(
+                        Arg::new("reveal-secret")
+                            .long("reveal-secret")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Also print the stored secret key (explicit opt-in; avoid in shared terminals and CI logs)"),
+                    ),
+            )
+            .subcommand(
                 Command::new("list")
                     .about("List all stored identities (public keys only)")
                     // #288 — explicit opt-in to showing secret keys
@@ -336,6 +467,56 @@ impl ForgePlugin for IdentityPlugin {
                     }
                     println!();
                     println!("fund on testnet: soroban-forge identity fund {name}");
+                }
+                Ok(())
+            }
+
+            Some(("import", sub)) => {
+                let name = sub.get_one::<String>("name").unwrap();
+                let force = sub.get_flag("force");
+                let secret = match sub.get_one::<String>("secret") {
+                    Some(secret) => secret.clone(),
+                    None => read_secret_line(std::io::stdin().lock())?,
+                };
+
+                let mut store = load_store(&path)?;
+                let identity = import_identity(&mut store, name, &secret, force)?;
+                save_store(&path, &store)?;
+
+                if ctx.json {
+                    // Never echo the secret back; the caller already has it.
+                    let report = serde_json::json!({
+                        "name": name,
+                        "public_key": identity.public_key,
+                        "imported": true,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                } else if !ctx.quiet {
+                    println!("imported identity `{name}`");
+                    println!("  public key: {}", identity.public_key);
+                }
+                Ok(())
+            }
+
+            Some(("show", sub)) => {
+                let name = sub.get_one::<String>("name").unwrap();
+                let reveal_secret = sub.get_flag("reveal-secret");
+                let store = load_store(&path)?;
+                let identity = store.identities.get(name.as_str()).ok_or_else(|| {
+                    ForgeError::InvalidArgument(format!(
+                        "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
+                    ))
+                })?;
+
+                if ctx.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&show_json(name, identity, reveal_secret)).unwrap()
+                    );
+                } else if !ctx.quiet || reveal_secret {
+                    // An explicit --reveal-secret is honoured even with --quiet:
+                    // the secret is the whole point of the invocation.
+                    print!("{}", format_show(name, identity, reveal_secret));
                 }
                 Ok(())
             }
@@ -687,6 +868,8 @@ mod tests {
             msg.contains("passphrase"),
             "error should explain a passphrase is needed: {msg}"
         );
+    }
+
     // #470 — a crash mid-write must not corrupt the identity store
     #[test]
     fn save_store_replaces_the_file_atomically() {
@@ -850,5 +1033,161 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("offline"), "error should mention offline: {msg}");
+    }
+
+    // ---- identity import (#421) ----
+
+    #[test]
+    fn import_derives_the_public_key_from_a_valid_secret() {
+        let (public, secret) = generate_keypair();
+        assert_eq!(public_key_from_secret(&secret).unwrap(), public);
+        // Surrounding whitespace (e.g. from a CI secret) is tolerated.
+        assert_eq!(public_key_from_secret(&format!("  {secret}\n")).unwrap(), public);
+
+        let mut store = IdentityStore::default();
+        let imported = import_identity(&mut store, "ci", &format!("{secret}\n"), false).unwrap();
+        assert_eq!(imported.public_key, public);
+        assert_eq!(imported.secret_key, secret);
+        assert_eq!(store.identities["ci"].public_key, public);
+    }
+
+    #[test]
+    fn import_rejects_malformed_secret_keys_without_echoing_them() {
+        let (public, secret) = generate_keypair();
+        let mut corrupted = secret.clone();
+        // Flip the last character so the strkey checksum no longer matches.
+        let last = corrupted.pop().unwrap();
+        corrupted.push(if last == 'A' { 'B' } else { 'A' });
+        let lowercase = secret.to_lowercase();
+
+        for bad in [
+            "",
+            "SABC",
+            "not-a-key",
+            public.as_str(), // a public key is not a secret key
+            corrupted.as_str(),
+            lowercase.as_str(),
+        ] {
+            let mut store = IdentityStore::default();
+            let err = import_identity(&mut store, "ci", bad, false).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("not a valid Stellar secret key"), "{bad:?}: {msg}");
+            if !bad.is_empty() {
+                assert!(!msg.contains(bad), "error must not echo the input: {msg}");
+            }
+            assert!(store.identities.is_empty(), "nothing stored for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn import_respects_force_like_generate() {
+        let (_, first) = generate_keypair();
+        let (second_public, second) = generate_keypair();
+        let mut store = IdentityStore::default();
+        import_identity(&mut store, "deployer", &first, false).unwrap();
+
+        let err = import_identity(&mut store, "deployer", &second, false).unwrap_err();
+        assert!(matches!(err, ForgeError::AlreadyExists(_)), "{err}");
+        assert_eq!(store.identities["deployer"].secret_key, first, "existing identity untouched");
+
+        import_identity(&mut store, "deployer", &second, true).unwrap();
+        assert_eq!(store.identities["deployer"].public_key, second_public);
+    }
+
+    #[test]
+    fn import_checks_the_name_before_validating_the_secret() {
+        // Same order as generate: a collision without --force is reported
+        // even if the secret is also bad.
+        let (_, secret) = generate_keypair();
+        let mut store = IdentityStore::default();
+        import_identity(&mut store, "x", &secret, false).unwrap();
+        assert!(matches!(
+            import_identity(&mut store, "x", "garbage", false),
+            Err(ForgeError::AlreadyExists(_))
+        ));
+    }
+
+    #[test]
+    fn import_subcommand_requires_exactly_one_secret_source() {
+        let cmd = || IdentityPlugin.command();
+        assert!(cmd().try_get_matches_from(["identity", "import", "ci"]).is_err());
+        assert!(cmd()
+            .try_get_matches_from(["identity", "import", "ci", "--secret", "S", "--secret-stdin"])
+            .is_err());
+        let m = cmd()
+            .try_get_matches_from(["identity", "import", "ci", "--secret", "SXYZ", "--force"])
+            .unwrap();
+        let (name, sub) = m.subcommand().unwrap();
+        assert_eq!(name, "import");
+        assert_eq!(sub.get_one::<String>("secret").map(String::as_str), Some("SXYZ"));
+        assert!(sub.get_flag("force"));
+        assert!(cmd()
+            .try_get_matches_from(["identity", "import", "ci", "--secret-stdin"])
+            .is_ok());
+    }
+
+    #[test]
+    fn secret_can_be_read_from_stdin() {
+        let (_, secret) = generate_keypair();
+        let input = format!("{secret}\nignored second line\n");
+        assert_eq!(read_secret_line(input.as_bytes()).unwrap(), secret);
+        assert!(read_secret_line("\n".as_bytes()).is_err());
+    }
+
+    // ---- identity show --reveal-secret (#422) ----
+
+    #[test]
+    fn show_prints_the_secret_only_when_explicitly_requested() {
+        let (public, secret) = generate_keypair();
+        let id = Identity {
+            public_key: public.clone(),
+            secret_key: secret.clone(),
+        };
+
+        let hidden = format_show("alice", &id, false);
+        assert!(hidden.contains(&public), "{hidden}");
+        assert!(!hidden.contains(&secret), "secret leaked without --reveal-secret: {hidden}");
+        assert!(hidden.contains("--reveal-secret"), "{hidden}");
+
+        let revealed = format_show("alice", &id, true);
+        assert!(revealed.contains(&secret), "{revealed}");
+
+        let json_hidden = show_json("alice", &id, false);
+        assert!(json_hidden.get("secret_key").is_none(), "{json_hidden}");
+        assert_eq!(json_hidden["public_key"], public);
+        assert_eq!(show_json("alice", &id, true)["secret_key"], secret);
+    }
+
+    #[test]
+    fn list_never_prints_secrets_by_default() {
+        let (public, secret) = generate_keypair();
+        let mut store = IdentityStore::default();
+        store.identities.insert(
+            "alice".into(),
+            Identity {
+                public_key: public.clone(),
+                secret_key: secret.clone(),
+            },
+        );
+        let out = format_list(&store);
+        assert!(out.contains(&public));
+        assert!(!out.contains(&secret));
+    }
+
+    #[test]
+    fn show_subcommand_has_an_opt_in_reveal_flag() {
+        let m = IdentityPlugin
+            .command()
+            .try_get_matches_from(["identity", "show", "alice"])
+            .unwrap();
+        let (name, sub) = m.subcommand().unwrap();
+        assert_eq!(name, "show");
+        assert!(!sub.get_flag("reveal-secret"), "secret must be hidden by default");
+
+        let m = IdentityPlugin
+            .command()
+            .try_get_matches_from(["identity", "show", "alice", "--reveal-secret"])
+            .unwrap();
+        assert!(m.subcommand().unwrap().1.get_flag("reveal-secret"));
     }
 }
