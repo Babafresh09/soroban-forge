@@ -377,3 +377,125 @@ fn network_show_json_no_default_returns_json_error() {
         serde_json::from_str(&stderr).expect("stderr must be JSON with --json flag: {stderr}");
     assert_eq!(parsed["exit_code"], 1);
 }
+
+// ---------------------------------------------------------------------------
+// #411 — network list --check
+// ---------------------------------------------------------------------------
+
+/// Seed the store under `config_home` with one reachable and one unreachable
+/// mock endpoint, and point every built-in preset at the unreachable one so
+/// the probe never leaves the machine.  Returns the listener keeping the
+/// reachable endpoint alive.
+#[cfg(target_os = "linux")]
+fn seed_mock_networks(config_home: &std::path::Path) -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let up = format!(
+        "http://127.0.0.1:{}/soroban/rpc",
+        listener.local_addr().unwrap().port()
+    );
+    let down_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let down = format!("http://127.0.0.1:{down_port}/soroban/rpc");
+
+    let mut networks = serde_json::Map::new();
+    let entry = |url: &str| serde_json::json!({ "rpc_url": url, "network_passphrase": "Mock Network" });
+    networks.insert("mock-up".into(), entry(&up));
+    networks.insert("mock-down".into(), entry(&down));
+    for builtin in ["testnet", "futurenet", "mainnet", "localnet"] {
+        networks.insert(builtin.into(), entry(&down));
+    }
+    let store = serde_json::json!({ "networks": networks, "default": "mock-up" });
+
+    let dir = config_home.join("soroban-forge");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("networks.json"), store.to_string()).unwrap();
+    listener
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn network_list_check_annotates_reachable_and_unreachable_endpoints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _listener = seed_mock_networks(tmp.path());
+
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args(["network", "list", "--check", "--timeout", "2"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let row = |name: &str| {
+        stdout
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("no row for {name}: {stdout}"))
+    };
+    assert!(row("mock-up").contains("[reachable, "), "{stdout}");
+    assert!(row("mock-down").contains("[unreachable: "), "{stdout}");
+    assert!(row("testnet").contains("[unreachable: "), "{stdout}");
+    assert!(stdout.contains("1 of 6 network(s) reachable"), "{stdout}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn network_list_check_json_carries_reachability_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _listener = seed_mock_networks(tmp.path());
+
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args(["--json", "network", "list", "--check", "--timeout", "2"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["networks"]["mock-up"]["reachable"], true, "{json}");
+    assert!(json["networks"]["mock-up"]["latency_ms"].is_u64(), "{json}");
+    assert_eq!(json["networks"]["mock-down"]["reachable"], false, "{json}");
+    assert!(json["networks"]["mock-down"]["error"].is_string(), "{json}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn network_list_without_check_is_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _listener = seed_mock_networks(tmp.path());
+
+    let text = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args(["network", "list"])
+        .output()
+        .unwrap();
+    assert!(text.status.success(), "{text:?}");
+    let stdout = String::from_utf8(text.stdout).unwrap();
+    assert!(!stdout.contains("reachable"), "{stdout}");
+    assert!(stdout.contains("* mock-up"), "{stdout}");
+
+    let json = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args(["--json", "network", "list"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(json["networks"]["mock-up"].get("reachable").is_none(), "{json}");
+}
+
+#[test]
+fn network_list_check_refuses_offline_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args(["--offline", "network", "list", "--check"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("offline"), "{stderr}");
+}

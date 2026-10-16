@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `soroban-forge optimize --all` optimizes every contract crate in a
+  workspace in one invocation, reporting one result per contract (an array
+  under `--json`) (#412)
+- `soroban-forge optimize --compare-to <report.json>` reports the size delta
+  (bytes and percent) against a report saved from an earlier
+  `optimize --json` run (#418)
+- `soroban-forge network list --check` probes each configured endpoint and
+  annotates which networks are reachable; plain `network list` stays
+  offline (#411)
 - `soroban-forge identity remove <name>` deletes a stored identity and reports
   a clear error when the name is not found (#420)
 - `soroban-forge --list --json` now emits structured `builtin` and `external`
@@ -50,6 +59,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `soroban-forge optimize` failures now include `stellar contract optimize`'s
+  stderr in the error message instead of only the exit status; under `-v` the
+  output still streams live (#417)
 - `soroban-forge bindings ts` panicked ("Unknown argument or group id")
   on the plain, no-flags invocation — `--out-dir`'s fallback lookup queried
   its own `visible_alias` ("output") as if it were a second, separate arg id
