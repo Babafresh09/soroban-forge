@@ -43,12 +43,22 @@ pub struct StorageMigration;
 
 #[contractimpl]
 impl StorageMigration {
-    /// Initialize the contract with a counter and name (v2 layout).
+    /// Initialize a fresh contract with a counter and name (v2 layout).
     ///
-    /// This also ensures that any v1 state is migrated to v2.
+    /// Runs once. It refuses whenever state already exists — v2 data from an
+    /// earlier `init` or a completed migration, or v1 data still waiting to
+    /// be migrated — so it can neither overwrite live state nor clobber a
+    /// migration.
+    /// A contract upgraded from v1 needs no `init`: its data is migrated on
+    /// first use.
     pub fn init(env: Env, initial_counter: u32, name: String) {
-        // Run migration if needed
-        Self::migrate_if_needed(&env);
+        // Existing state of either layout means this contract is already set
+        // up. (A fresh contract has neither key; `migrate_if_needed` is not
+        // called here because an unset version reads as v1.)
+        let storage = env.storage().instance();
+        if storage.has(&DataKey::CounterV2) || storage.has(&DataKey::CounterV1) {
+            panic!("already initialized");
+        }
 
         // Set the v2 state
         env.storage().instance().set(&DataKey::CounterV2, &initial_counter);

@@ -155,3 +155,17 @@ forge_tests` inside `src/`
 - Comprehensive documentation suite
 - Example contracts for common DeFi patterns
 - CI pipeline with fmt, clippy, test, and WASM build steps
+
+### Security
+
+- `governance` template: `cast_vote` no longer takes a caller-supplied
+  `weight`, which let one voter pass any proposal (or subtract votes with a
+  negative weight). Each admin-registered member now has exactly one vote,
+  snapshotted at proposal creation; the README explains where voting power
+  comes from and how to switch to snapshotted token weighting (#512)
+- `storage-migration` template: `init` runs only once and refuses to
+  overwrite existing v1 or v2 state (#511)
+- `payment-splitter` template: `initialize` can no longer be re-run to
+  rewrite the payee table and reset deposit accounting (#510)
+- `lottery` template: a second `initialize` is rejected, so an in-progress
+  or finished lottery can no longer be reset or taken over (#509)

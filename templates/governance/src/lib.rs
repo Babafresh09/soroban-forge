@@ -1,6 +1,28 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Map, Vec};
+//! DAO-style governance: members open proposals and vote on them; a proposal
+//! executes once its voting period ends with quorum and a majority in favour.
+//!
+//! **Voting power.** Every registered member has exactly one vote per
+//! proposal. Callers cannot choose their weight: `cast_vote` takes no weight
+//! argument and always counts `VOTE_WEIGHT` (1), so a single voter can never
+//! outvote everyone else, and negative or inflated votes are impossible by
+//! construction.
+//!
+//! Members are registered by the admin. Eligibility is snapshotted per
+//! proposal: only members registered at or before the ledger a proposal was
+//! created in may vote on it, so adding members mid-vote cannot swing an open
+//! proposal. Removing a member revokes their ability to vote from then on.
+//!
+//! To weight votes by token holdings instead, replace `voting_power` with a
+//! balance read through `token::Client` — and snapshot balances when the
+//! proposal is created, or the same tokens can be moved between accounts and
+//! voted with repeatedly.
+
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+/// Votes counted for each eligible voter.
+pub const VOTE_WEIGHT: i128 = 1;
 
 /// A governance proposal.
 #[contracttype]
@@ -8,12 +30,14 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Map, Vec};
 pub struct Proposal {
     pub id: u64,
     pub proposer: Address,
+    /// Ledger sequence the proposal was created in; only members registered
+    /// at or before it may vote (membership snapshot).
+    pub created_ledger: u32,
     /// Absolute ledger sequence at which voting closes.
     pub voting_deadline: u32,
-    /// Votes cast in favour (weighted by caller's token balance, simplified to
-    /// 1 vote per call in this template — adapt to your token contract).
+    /// Number of members who voted in favour (one vote each).
     pub votes_for: i128,
-    /// Votes cast against.
+    /// Number of members who voted against.
     pub votes_against: i128,
     /// Whether the proposal has been executed.
     pub executed: bool,
@@ -30,22 +54,51 @@ pub enum DataKey {
     /// Duration in ledgers for the voting period.
     VotingPeriod,
     Admin,
+    /// Ledger sequence at which an address became a voting member.
+    MemberSince(Address),
+    /// Number of registered members.
+    MemberCount,
 }
 
 #[contract]
 pub struct GovernanceContract;
 
+fn admin(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .expect("not initialized")
+}
+
+/// Voting power of `voter` on `proposal`: `VOTE_WEIGHT` for a member who was
+/// registered when the proposal was created, otherwise none. Never derived
+/// from anything the voter passes in.
+fn voting_power(env: &Env, voter: &Address, proposal: &Proposal) -> i128 {
+    match env
+        .storage()
+        .instance()
+        .get::<_, u32>(&DataKey::MemberSince(voter.clone()))
+    {
+        Some(since) if since <= proposal.created_ledger => VOTE_WEIGHT,
+        _ => 0,
+    }
+}
+
 #[contractimpl]
 impl GovernanceContract {
     /// Initialize the contract.
     ///
-    /// * `admin`         — address allowed to change governance parameters
-    /// * `quorum`        — minimum total votes (for + against) required to execute
+    /// * `admin`         — address allowed to manage members
+    /// * `quorum`        — minimum total votes (for + against) required to execute;
+    ///   with one vote per member this is a number of members
     /// * `voting_period` — voting window in ledgers (~5 s per ledger on mainnet)
     pub fn initialize(env: Env, admin: Address, quorum: i128, voting_period: u32) {
         admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
+        }
+        if quorum <= 0 {
+            panic!("quorum must be positive");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Quorum, &quorum);
@@ -53,13 +106,64 @@ impl GovernanceContract {
             .instance()
             .set(&DataKey::VotingPeriod, &voting_period);
         env.storage().instance().set(&DataKey::NextId, &0u64);
+        env.storage().instance().set(&DataKey::MemberCount, &0u32);
     }
 
-    /// Create a new governance proposal.
+    /// Register `member` as a voter (admin only). Members may vote on
+    /// proposals created from this ledger onwards.
+    pub fn add_member(env: Env, member: Address) {
+        admin(&env).require_auth();
+        let key = DataKey::MemberSince(member);
+        if env.storage().instance().has(&key) {
+            panic!("already a member");
+        }
+        env.storage()
+            .instance()
+            .set(&key, &env.ledger().sequence());
+        let count: u32 = Self::member_count(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::MemberCount, &(count + 1));
+    }
+
+    /// Remove `member` (admin only). They can no longer vote; votes they
+    /// already cast stay counted.
+    pub fn remove_member(env: Env, member: Address) {
+        admin(&env).require_auth();
+        let key = DataKey::MemberSince(member);
+        if !env.storage().instance().has(&key) {
+            panic!("not a member");
+        }
+        env.storage().instance().remove(&key);
+        let count: u32 = Self::member_count(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::MemberCount, &(count - 1));
+    }
+
+    /// Whether `address` is currently a registered member.
+    pub fn is_member(env: Env, address: Address) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::MemberSince(address))
+    }
+
+    /// Number of registered members.
+    pub fn member_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MemberCount)
+            .unwrap_or(0)
+    }
+
+    /// Create a new governance proposal (members only).
     ///
     /// Returns the proposal id.
     pub fn create_proposal(env: Env, proposer: Address) -> u64 {
         proposer.require_auth();
+        if !Self::is_member(env.clone(), proposer.clone()) {
+            panic!("only members can create proposals");
+        }
 
         let id: u64 = env
             .storage()
@@ -71,11 +175,13 @@ impl GovernanceContract {
             .instance()
             .get(&DataKey::VotingPeriod)
             .unwrap_or(1000);
-        let deadline = env.ledger().sequence() + voting_period;
+        let created_ledger = env.ledger().sequence();
+        let deadline = created_ledger + voting_period;
 
         let proposal = Proposal {
             id,
             proposer,
+            created_ledger,
             voting_deadline: deadline,
             votes_for: 0,
             votes_against: 0,
@@ -90,11 +196,14 @@ impl GovernanceContract {
         id
     }
 
-    /// Cast a weighted vote on a proposal.
+    /// Cast a vote on a proposal.
     ///
     /// * `in_favour` — `true` to vote for, `false` to vote against
-    /// * `weight`    — voting power (e.g. token balance held by the voter)
-    pub fn cast_vote(env: Env, voter: Address, proposal_id: u64, in_favour: bool, weight: i128) {
+    ///
+    /// The vote counts exactly `VOTE_WEIGHT` (1). Voting power comes from
+    /// membership at the time the proposal was created, never from the
+    /// caller, so it cannot be inflated or negative.
+    pub fn cast_vote(env: Env, voter: Address, proposal_id: u64, in_favour: bool) {
         voter.require_auth();
 
         // Prevent double-voting.
@@ -113,10 +222,15 @@ impl GovernanceContract {
             panic!("voting period has ended");
         }
 
+        let power = voting_power(&env, &voter, &proposal);
+        if power <= 0 {
+            panic!("not eligible to vote on this proposal");
+        }
+
         if in_favour {
-            proposal.votes_for += weight;
+            proposal.votes_for += power;
         } else {
-            proposal.votes_against += weight;
+            proposal.votes_against += power;
         }
 
         env.storage()
