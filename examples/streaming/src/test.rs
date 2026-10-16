@@ -92,3 +92,34 @@ fn double_claim_fails() {
     contract.claim();
     contract.claim();
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn initialize_twice_is_rejected() {
+    let env = Env::default();
+    let (contract, token, sender, recipient, _start_ts) = setup(&env);
+    contract.initialize(&sender, &token.address, &recipient, &4000, &100_000);
+}
+
+#[test]
+fn an_attacker_cannot_reinitialize_to_redirect_the_stream() {
+    let env = Env::default();
+    let (contract, token, _sender, recipient, start_ts) = setup(&env);
+
+    // Part of the stream has already been claimed.
+    env.ledger().with_mut(|li| li.timestamp = start_ts + 1000);
+    assert_eq!(contract.claim(), 25_000);
+
+    let attacker = Address::generate(&env);
+    let result = contract.try_initialize(&attacker, &token.address, &attacker, &1, &100_000);
+    assert!(result.is_err(), "re-initialization must fail");
+
+    // The schedule and the claimed amount are untouched: the rest streams to
+    // the original recipient, and nothing goes to the attacker.
+    env.ledger().with_mut(|li| li.timestamp = start_ts + 4000);
+    assert_eq!(contract.get_claimable_amount(), 75_000);
+    assert_eq!(contract.claim(), 75_000);
+    assert_eq!(token.client.balance(&recipient), 100_000);
+    assert_eq!(token.client.balance(&attacker), 0);
+}
+

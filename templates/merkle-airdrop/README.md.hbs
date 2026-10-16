@@ -30,7 +30,7 @@ against the contract's before publishing a root.
 
 | function                            | description                                    |
 |-------------------------------------|------------------------------------------------|
-| `initialize(admin, token, root)`    | store the merkle root and the token            |
+| `initialize(admin, token, root)`    | store the merkle root and the token (once)     |
 | `fund(amount)`                      | admin deposits the tokens to be claimed        |
 | `claim(claimant, amount, proof)`    | claim once against the current root            |
 | `verify(claimant, amount, proof)`   | read-only eligibility check for a UI           |
@@ -41,6 +41,16 @@ against the contract's before publishing a root.
 Claim markers are written to persistent storage and their TTL is extended as
 they are created, so a claimant cannot get a second payout by waiting for the
 entry to be archived.
+
+### Admin is fixed at deployment
+
+`initialize` can run only once: a second call fails with `already
+initialized`. The admin (who can `fund`, `set_root` and `sweep`), the token
+and the initial root are therefore set for the life of the contract. Deploy
+and initialize in the same transaction (or move setup into a
+`__constructor`) so nobody can call `initialize` before you do. To change the
+admin, add an explicit admin-authorized transfer function rather than
+re-running `initialize`.
 
 ## Develop
 

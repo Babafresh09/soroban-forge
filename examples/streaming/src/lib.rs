@@ -46,6 +46,13 @@ impl StreamingContract {
         duration_seconds: u64,
         total_amount: i128,
     ) {
+        // Runs once: the stream's parameters are fixed when it is created.
+        // Otherwise anyone (authorizing as the new "sender") could overwrite
+        // the recipient, schedule and amount and reset `Claimed`, redirecting
+        // tokens the original sender already funded.
+        if env.storage().instance().has(&DataKey::Sender) {
+            panic!("already initialized");
+        }
         sender.require_auth();
 
         if total_amount <= 0 {

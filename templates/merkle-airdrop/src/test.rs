@@ -207,3 +207,31 @@ fn admin_sweeps_what_is_left_after_the_window() {
     assert_eq!(f.token.client.balance(&f.admin), left);
     assert_eq!(f.token.client.balance(&f.contract_id), 0);
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn initialize_twice_is_rejected() {
+    let env = Env::default();
+    let f = setup(&env);
+    f.contract.initialize(&f.admin, &f.token.address, &f.tree.root);
+}
+
+#[test]
+fn an_attacker_cannot_reinitialize_to_take_over_and_sweep() {
+    let env = Env::default();
+    let f = setup(&env);
+    let attacker = Address::generate(&env);
+    let attacker_root = BytesN::from_array(&env, &[7_u8; 32]);
+
+    let result = f
+        .contract
+        .try_initialize(&attacker, &f.token.address, &attacker_root);
+    assert!(result.is_err(), "re-initialization must fail");
+
+    // Admin and root are unchanged, so the sweep still pays the real admin.
+    assert_eq!(f.contract.admin(), f.admin);
+    assert_eq!(f.contract.root(), f.tree.root);
+    assert_eq!(f.contract.sweep(), TOTAL);
+    assert_eq!(f.token.client.balance(&f.admin), TOTAL);
+    assert_eq!(f.token.client.balance(&attacker), 0);
+}

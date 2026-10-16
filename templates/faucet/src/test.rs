@@ -96,3 +96,28 @@ fn cooldown_is_per_address() {
     assert_eq!(token.client.balance(&alice), 100);
     assert_eq!(token.client.balance(&bob), 100);
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn initialize_twice_is_rejected() {
+    let env = Env::default();
+    let (contract, token, admin, _start_ts) = setup(&env);
+    contract.initialize(&admin, &token.address, &100, &3600);
+}
+
+#[test]
+fn an_attacker_cannot_reinitialize_to_drain_the_faucet() {
+    let env = Env::default();
+    let (contract, token, _admin, _start_ts) = setup(&env);
+    let attacker = Address::generate(&env);
+
+    // Whole balance per claim, no cooldown.
+    let result = contract.try_initialize(&attacker, &token.address, &1_000_000, &0);
+    assert!(result.is_err(), "re-initialization must fail");
+
+    // The original limits still apply: one claim pays 100, and a second claim
+    // before the cooldown is refused.
+    assert_eq!(contract.claim(&attacker), 100);
+    assert!(contract.try_claim(&attacker).is_err());
+    assert_eq!(token.client.balance(&attacker), 100);
+}
