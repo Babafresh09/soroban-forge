@@ -99,6 +99,19 @@ result. The image is pinned by digest (`@sha256:…`), so the bytes
 produced for a given source tree do not depend on the host toolchain —
 useful when verifying a release against the original sources.
 
+The pin is the official `stellar/stellar-cli` image, which ships the
+`stellar` binary and the `wasm32v1-none` target soroban-forge builds
+against:
+
+```
+docker.io/stellar/stellar-cli@sha256:daed639814911ebcafe181027fe40ab24fa6b5fe24ce0b388f95f1f38f9856ff
+```
+
+The contract directory is bind-mounted at `/src` (writable — the build
+writes `target/`, which is also how the wasm reaches the host to be
+hashed) and the entrypoint is set explicitly to `stellar`, because the
+image already entrypoints there.
+
 A missing Docker daemon is reported as exit `2` (missing tool) so CI can
 distinguish it from a real mismatch:
 
@@ -107,9 +120,17 @@ $ soroban-forge verify --reproducible CDLZ…
 error: docker not found on PATH (run `soroban-forge doctor` for install instructions)
 ```
 
-To refresh the pin, update the `REPRODUCIBLE_IMAGE` constant to the new
-digest and rebuild; the comparison only succeeds with the exact image
-that produced the bytes in the first place.
+To refresh the pin, resolve the digest of the release you want and update
+the `REPRODUCIBLE_IMAGE` constant to it:
+
+```sh
+docker buildx imagetools inspect stellar/stellar-cli:26.1.0 --format '{{.Manifest.Digest}}'
+```
+
+Then rebuild; the comparison only succeeds with the exact image that
+produced the bytes in the first place. A unit test rejects the all-zero
+placeholder digest the constant used to carry, so an accidental revert
+fails in CI rather than at `docker run`.
 
 ### Exit codes
 
