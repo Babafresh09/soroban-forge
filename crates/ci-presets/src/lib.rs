@@ -673,35 +673,6 @@ impl ForgePlugin for CiPresetsPlugin {
             return Ok(());
         }
 
-            for (preset_name, dest_rel_override) in selected.drain(..) {
-                let file = provider_dir
-                    .get_file(format!("{provider}/{preset_name}"))
-                    .ok_or_else(|| ForgeError::Template(format!("missing preset file {provider}/{preset_name}")))?;
-                let contents = file
-                    .contents_utf8()
-                    .ok_or_else(|| ForgeError::Template(format!("preset {preset_name} is not UTF-8")))?;
-                let dest_rel = dest_rel_override.unwrap_or(output_dir(provider));
-                let out_path = dir.join(dest_rel).join(preset_name);
-                let vars = {
-                    let mut vars = Vars::new();
-                    vars.insert("project_name".into(), name.to_string());
-                    vars.insert("crate_name".into(), name.replace('-', "_"));
-                    vars.insert("msrv".into(), opts.msrv.clone().unwrap_or_else(|| DEFAULT_MSRV.to_string()));
-                    vars.insert("max_size".into(), max_size.to_string());
-                    vars
-                };
-                let rendered = render_preset(&dir, provider, contents, &vars)?;
-                if out_path.exists() {
-                    let existing = std::fs::read_to_string(&out_path)
-                        .map_err(ForgeError::io(format!("reading {}", out_path.display())))?;
-                    if existing == rendered {
-                        continue;
-                    }
-                }
-            }
-            return Ok(());
-        }
-
         // ── generate ───────────────────────────────────────────────────────
         let release = matches.get_flag("release");
         let force = matches.get_flag("force");

@@ -19,6 +19,8 @@ use soroban_forge_core::{ForgeContext, ForgeError, ForgePlugin, Result};
 pub struct Identity {
     pub public_key: String,
     pub secret_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub funded_on: Vec<String>,
 }
 
 /// The on-disk identity store.
@@ -26,14 +28,20 @@ pub struct Identity {
 pub struct IdentityStore {
     #[serde(default)]
     pub identities: BTreeMap<String, Identity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 /// Return the path to the identity store file.
 /// `~/.config/soroban-forge/identities.json`
 pub fn store_path() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| {
-        ForgeError::Other("could not determine user config directory".into())
-    })?;
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+        .ok_or_else(|| {
+            ForgeError::Other("could not determine user config directory".into())
+        })?;
     Ok(config_dir.join("soroban-forge").join("identities.json"))
 }
 
@@ -70,7 +78,102 @@ fn remove_identity(path: &PathBuf, name: &str) -> Result<()> {
             "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
         )));
     }
+    if store.default.as_deref() == Some(name) {
+        store.default = None;
+    }
     save_store(path, &store)
+}
+
+/// Persist the active identity choice into `forge.toml` in `cwd`.
+///
+/// If the file does not exist it is created with just the `[identity]` section.
+/// If it exists the `[identity]` section is patched (or appended) without
+/// disturbing any other content.
+pub fn write_identity_to_forge_toml(cwd: &std::path::Path, name: &str) -> Result<()> {
+    let path = cwd.join("forge.toml");
+
+    let existing = if path.is_file() {
+        std::fs::read_to_string(&path)
+            .map_err(ForgeError::io(format!("reading {}", path.display())))?
+    } else {
+        String::new()
+    };
+
+    let updated = patch_forge_toml_identity(&existing, name);
+    std::fs::write(&path, updated)
+        .map_err(ForgeError::io(format!("writing {}", path.display())))
+}
+
+/// Patch (or append) the `[identity]` section in raw `forge.toml` text.
+///
+/// Rules:
+/// - If an `[identity]` section already exists, the `default = …` key within it is
+///   replaced (or inserted if missing). Other keys in the section are preserved.
+/// - If no `[identity]` section exists, one is appended.
+pub fn patch_forge_toml_identity(existing: &str, name: &str) -> String {
+    let original_lines: Vec<&str> = existing.lines().collect();
+    let mut out_lines: Vec<String> = Vec::with_capacity(original_lines.len() + 3);
+
+    let mut in_identity_section = false;
+    let mut default_key_written = false;
+    let mut identity_section_header_idx: Option<usize> = None;
+
+    for line in &original_lines {
+        let trimmed = line.trim();
+
+        if trimmed == "[identity]" {
+            in_identity_section = true;
+            identity_section_header_idx = Some(out_lines.len());
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        // Entering a new section other than [identity]
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_identity_section && !default_key_written {
+                out_lines.push(format!("default = \"{name}\""));
+                default_key_written = true;
+            }
+            in_identity_section = false;
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        // Replace the `default = ...` key inside [identity]
+        if in_identity_section && !default_key_written {
+            if let Some(eq_pos) = trimmed.find('=') {
+                let key = trimmed[..eq_pos].trim();
+                if key == "default" {
+                    out_lines.push(format!("default = \"{name}\""));
+                    default_key_written = true;
+                    continue; // skip old line
+                }
+            }
+        }
+
+        out_lines.push(line.to_string());
+    }
+
+    // EOF while still inside [identity] and default was never written
+    if in_identity_section && !default_key_written {
+        out_lines.push(format!("default = \"{name}\""));
+        default_key_written = true;
+    }
+
+    // No [identity] section found at all — append
+    if identity_section_header_idx.is_none() && !default_key_written {
+        if !out_lines.is_empty() && !out_lines.last().map(|l| l.is_empty()).unwrap_or(true) {
+            out_lines.push(String::new());
+        }
+        out_lines.push("[identity]".to_string());
+        out_lines.push(format!("default = \"{name}\""));
+    }
+
+    let mut result = out_lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 /// Generate a new Stellar keypair and return `(public_key, secret_key)` as
@@ -293,7 +396,18 @@ pub fn format_list(store: &IdentityStore) -> String {
     let mut out = String::from("stored identities:\n\n");
     let name_width = store.identities.keys().map(|k| k.len()).max().unwrap_or(0);
     for (name, id) in &store.identities {
-        out.push_str(&format!("  {:<width$}  {}\n", name, id.public_key, width = name_width));
+        let funded_suffix = if id.funded_on.is_empty() {
+            String::new()
+        } else {
+            format!("  funded: {}", id.funded_on.join(", "))
+        };
+        out.push_str(&format!(
+            "  {:<width$}  {}{}\n",
+            name,
+            id.public_key,
+            funded_suffix,
+            width = name_width
+        ));
     }
     out
 }
@@ -417,6 +531,15 @@ impl ForgePlugin for IdentityPlugin {
                             .required(true),
                     ),
             )
+            .subcommand(
+                Command::new("use")
+                    .about("Select a default identity")
+                    .arg(
+                        Arg::new("name")
+                            .help("Name of the identity to set as default")
+                            .required(true),
+                    ),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -440,6 +563,7 @@ impl ForgePlugin for IdentityPlugin {
                     Identity {
                         public_key: public_key.clone(),
                         secret_key: secret_key.clone(),
+                        funded_on: Vec::new(),
                     },
                 );
                 save_store(&path, &store)?;
@@ -536,7 +660,10 @@ impl ForgePlugin for IdentityPlugin {
                             .map(|(k, v)| {
                                 (
                                     k.as_str(),
-                                    serde_json::json!({ "public_key": v.public_key }),
+                                    serde_json::json!({
+                                        "public_key": v.public_key,
+                                        "funded_on": v.funded_on,
+                                    }),
                                 )
                             })
                             .collect();
@@ -548,11 +675,17 @@ impl ForgePlugin for IdentityPlugin {
                         println!("stored identities:\n");
                         let name_width = store.identities.keys().map(|k| k.len()).max().unwrap_or(0);
                         for (name, id) in &store.identities {
+                            let funded_suffix = if id.funded_on.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  funded: {}", id.funded_on.join(", "))
+                            };
                             println!(
-                                "  {:<width$}  pub: {}  secret: {}",
+                                "  {:<width$}  pub: {}  secret: {}{}",
                                 name,
                                 id.public_key,
                                 id.secret_key,
+                                funded_suffix,
                                 width = name_width
                             );
                         }
@@ -571,6 +704,31 @@ impl ForgePlugin for IdentityPlugin {
                     println!("{}", serde_json::json!({ "name": name, "removed": true }));
                 } else if !ctx.quiet {
                     println!("removed identity `{name}`");
+                }
+                Ok(())
+            }
+
+            Some(("use", sub)) => {
+                let name = sub.get_one::<String>("name").unwrap();
+                let mut store = load_store(&path)?;
+
+                if !store.identities.contains_key(name.as_str()) {
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
+                    )));
+                }
+
+                store.default = Some(name.clone());
+                save_store(&path, &store)?;
+
+                write_identity_to_forge_toml(&ctx.cwd, name)?;
+
+                if ctx.json {
+                    let report = serde_json::json!({ "default": name });
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                } else if !ctx.quiet {
+                    println!("using `{name}` as the default identity");
+                    println!("  recorded in forge.toml and identities.json");
                 }
                 Ok(())
             }
@@ -604,31 +762,47 @@ impl ForgePlugin for IdentityPlugin {
                     }
                 }
 
-                let store = load_store(&path)?;
-                let id = store.identities.get(name.as_str()).ok_or_else(|| {
-                    ForgeError::InvalidArgument(format!(
-                        "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
-                    ))
-                })?;
+                let mut store = load_store(&path)?;
+                let (pubkey, mut funded_on) = {
+                    let id = store.identities.get(name.as_str()).ok_or_else(|| {
+                        ForgeError::InvalidArgument(format!(
+                            "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
+                        ))
+                    })?;
+                    (id.public_key.clone(), id.funded_on.clone())
+                };
+
+                let net_name = match effective_passphrase {
+                    Some(p) if p.contains("Future Network") => "futurenet",
+                    _ => "testnet",
+                };
 
                 if !ctx.quiet {
-                    println!("funding `{name}` ({}) via testnet friendbot...", id.public_key);
+                    println!("funding `{name}` ({pubkey}) via {net_name} friendbot...");
                 }
 
                 // #287 — fund_friendbot now returns the balance
-                let balance = fund_friendbot(&id.public_key, effective_passphrase, ctx.timeout())?;
+                let balance = fund_friendbot(&pubkey, effective_passphrase, ctx.timeout())?;
+
+                if !funded_on.contains(&net_name.to_string()) {
+                    funded_on.push(net_name.to_string());
+                }
+                if let Some(id) = store.identities.get_mut(name.as_str()) {
+                    id.funded_on = funded_on;
+                    save_store(&path, &store)?;
+                }
 
                 if ctx.json {
                     let report = serde_json::json!({
                         "name": name,
-                        "public_key": id.public_key,
+                        "public_key": pubkey,
                         "funded": true,
-                        "network": "testnet",
+                        "network": net_name,
                         "balance_xlm": balance,
                     });
                     println!("{}", serde_json::to_string_pretty(&report).unwrap());
                 } else if !ctx.quiet {
-                    println!("funded `{name}` on testnet.");
+                    println!("funded `{name}` on {net_name}.");
                     println!("  balance: {balance} XLM");
                 }
                 Ok(())
@@ -672,6 +846,7 @@ mod tests {
             Identity {
                 public_key: "GABC".into(),
                 secret_key: "SABC".into(),
+                funded_on: Vec::new(),
             },
         );
         save_store(&path, &store).unwrap();
@@ -700,6 +875,7 @@ mod tests {
                 Identity {
                     public_key: format!("G{name}"),
                     secret_key: format!("S{name}"),
+                    funded_on: Vec::new(),
                 },
             );
         }
@@ -729,6 +905,7 @@ mod tests {
             Identity {
                 public_key: "GAAA".into(),
                 secret_key: "SAAA".into(),
+                funded_on: Vec::new(),
             },
         );
         store.identities.insert(
@@ -736,6 +913,7 @@ mod tests {
             Identity {
                 public_key: "GBBB".into(),
                 secret_key: "SBBB".into(),
+                funded_on: Vec::new(),
             },
         );
         let output = format_list(&store);
@@ -884,14 +1062,14 @@ mod tests {
         let mut store = IdentityStore::default();
         store.identities.insert(
             "alice".into(),
-            Identity { public_key: "GALICE".into(), secret_key: "SALICE".into() },
+            Identity { public_key: "GALICE".into(), secret_key: "SALICE".into(), funded_on: Vec::new() },
         );
         save_store(&path, &store).unwrap();
         let first = std::fs::read_to_string(&path).unwrap();
 
         store.identities.insert(
             "bob".into(),
-            Identity { public_key: "GBOB".into(), secret_key: "SBOB".into() },
+            Identity { public_key: "GBOB".into(), secret_key: "SBOB".into(), funded_on: Vec::new() },
         );
         save_store(&path, &store).unwrap();
 
@@ -927,7 +1105,7 @@ mod tests {
         let mut store = IdentityStore::default();
         store.identities.insert(
             "alice".into(),
-            Identity { public_key: "GALICE".into(), secret_key: "SALICE".into() },
+            Identity { public_key: "GALICE".into(), secret_key: "SALICE".into(), funded_on: Vec::new() },
         );
         save_store(&path, &store).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
@@ -942,7 +1120,7 @@ mod tests {
         let mut updated = store.clone();
         updated.identities.insert(
             "bob".into(),
-            Identity { public_key: "GBOB".into(), secret_key: "SBOB".into() },
+            Identity { public_key: "GBOB".into(), secret_key: "SBOB".into(), funded_on: Vec::new() },
         );
         let result = save_store(&path, &updated);
 
@@ -1005,6 +1183,88 @@ mod tests {
         assert!(sub_names.contains(&"list"));
         assert!(sub_names.contains(&"fund"));
         assert!(sub_names.contains(&"remove"));
+        assert!(sub_names.contains(&"use"));
+    }
+
+    // #428 — funded marker is recorded in store and displayed in format_list
+    #[test]
+    fn funded_marker_recorded_and_displayed() {
+        let mut store = IdentityStore::default();
+        let id = Identity {
+            public_key: "GALICE".into(),
+            secret_key: "SALICE".into(),
+            funded_on: vec!["testnet".into()],
+        };
+        store.identities.insert("alice".into(), id);
+
+        let list_output = format_list(&store);
+        assert!(list_output.contains("alice"));
+        assert!(list_output.contains("GALICE"));
+        assert!(list_output.contains("funded: testnet"), "list must show funded marker: {list_output}");
+    }
+
+    // #427 — identity use sets default in store and writes forge.toml
+    #[test]
+    fn identity_use_sets_default_and_writes_forge_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_file = tmp.path().join("identities.json");
+        let mut store = IdentityStore::default();
+        store.identities.insert(
+            "alice".into(),
+            Identity {
+                public_key: "GALICE".into(),
+                secret_key: "SALICE".into(),
+                funded_on: Vec::new(),
+            },
+        );
+        save_store(&store_file, &store).unwrap();
+
+        // Test patching forge.toml
+        write_identity_to_forge_toml(tmp.path(), "alice").unwrap();
+        let toml_content = std::fs::read_to_string(tmp.path().join("forge.toml")).unwrap();
+        assert!(toml_content.contains("[identity]"));
+        assert!(toml_content.contains("default = \"alice\""));
+
+        // Test updating default in store
+        store.default = Some("alice".into());
+        save_store(&store_file, &store).unwrap();
+
+        let loaded = load_store(&store_file).unwrap();
+        assert_eq!(loaded.default.as_deref(), Some("alice"));
+    }
+
+    // #427 — removing the default identity clears the default marker
+    #[test]
+    fn identity_remove_clears_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_file = tmp.path().join("identities.json");
+        let mut store = IdentityStore::default();
+        store.identities.insert(
+            "alice".into(),
+            Identity {
+                public_key: "GALICE".into(),
+                secret_key: "SALICE".into(),
+                funded_on: Vec::new(),
+            },
+        );
+        store.default = Some("alice".into());
+        save_store(&store_file, &store).unwrap();
+
+        remove_identity(&store_file, "alice").unwrap();
+
+        let loaded = load_store(&store_file).unwrap();
+        assert!(!loaded.identities.contains_key("alice"));
+        assert!(loaded.default.is_none());
+    }
+
+    // #427 — patch_forge_toml_identity replaces existing default key cleanly
+    #[test]
+    fn test_patch_forge_toml_identity() {
+        let existing = "[project]\nname = \"demo\"\n\n[identity]\ndefault = \"bob\"\n";
+        let patched = patch_forge_toml_identity(existing, "alice");
+        assert!(patched.contains("[project]"));
+        assert!(patched.contains("default = \"alice\""));
+        assert!(!patched.contains("default = \"bob\""));
     }
 
     // #287 — fund refuses offline

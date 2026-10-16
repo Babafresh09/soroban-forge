@@ -2135,7 +2135,7 @@ mod tests {
                 "install the wasm32v1-none target via your system package manager or the Rust distribution you installed; rustup is not available on PATH"
             )
         );
-        assert!(!fix.unwrap().contains("rustup"));
+        assert!(!fix.unwrap().contains("rustup target add"));
     }
 
     #[test]
@@ -2207,6 +2207,7 @@ mod tests {
     fn lockfile_present_and_not_ignored_passes() {
         let check = classify_cargo_lock(true, LockIgnored::No);
         assert_eq!(check.status, Status::Pass);
+        assert!(check.fix.is_none());
     }
 
     // ---- disk space check ----
@@ -2238,6 +2239,7 @@ mod tests {
         // suggests version control would drop it.
         let check = classify_cargo_lock(true, LockIgnored::Unknown);
         assert_eq!(check.status, Status::Pass);
+        assert!(check.fix.is_none());
     }
 
     #[test]

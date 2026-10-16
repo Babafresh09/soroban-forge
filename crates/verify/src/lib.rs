@@ -849,6 +849,18 @@ impl ForgePlugin for VerifyPlugin {
                     .value_name("PATH")
                     .help("Keep the fetched on-chain wasm at PATH; with multiple IDs, PATH must be a directory"),
             )
+            .arg(
+                Arg::new("wasm-hash")
+                    .long("wasm-hash")
+                    .value_name("SHA256")
+                    .help("Compare the local wasm to this known deployed SHA-256 without fetching"),
+            )
+            .arg(
+                Arg::new("summary")
+                    .long("summary")
+                    .action(ArgAction::SetTrue)
+                    .help("Print a one-line verification summary for CI logs"),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {

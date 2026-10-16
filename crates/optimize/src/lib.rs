@@ -1126,6 +1126,7 @@ mod tests {
             .to_string();
         assert!(help.contains("--in-place"), "{help}");
 
+        let cmd = soroban_forge_core::cli::build_command(&plugins);
         let matches = cmd
             .try_get_matches_from(["soroban-forge", "optimize", "--in-place"])
             .unwrap();
