@@ -38,6 +38,12 @@ impl FaucetContract {
         amount_per_claim: i128,
         cooldown_seconds: u64,
     ) {
+        // Runs once: otherwise anyone could re-initialize with themselves as
+        // admin, `amount_per_claim` equal to the whole balance and no
+        // cooldown, then drain the faucet in a single claim.
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
         admin.require_auth();
 
         if amount_per_claim <= 0 {

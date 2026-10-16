@@ -59,6 +59,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - New `pausable` template — a minimal circuit breaker: an admin fixed at
   deploy time can `pause`/`unpause`, and guarded entrypoints reject calls with
   `Error::Paused` while paused
+- Templates `merkle-airdrop`, `faucet`, `subscription` and `streaming`:
+  `initialize` can no longer be re-run. Anyone could previously call it again
+  to take over the airdrop admin and `sweep`, drain the faucet, redirect
+  subscription pulls to themselves, or redirect a funded stream; each now
+  fails with `already initialized` (#505, #506, #507, #508)
 - `soroban-forge new --license apache-2.0|mit|unlicense` writes a LICENSE
   file (author and year filled in) and sets the matching `license` field in
   the generated `Cargo.toml`. Omitting the flag keeps prior behaviour: no

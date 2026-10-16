@@ -53,7 +53,15 @@ impl SubscriptionContract {
     /// * `token`    — contract address of the SEP-41 token to charge in
     /// * `amount`   — amount charged per interval
     /// * `interval` — seconds between charges
+    ///
+    /// Runs once: merchant, token, amount and interval are fixed afterwards.
+    /// Subscribers' allowances are pulled to the stored merchant, so a second
+    /// `initialize` would let anyone redirect those pulls to themselves at a
+    /// higher amount.
     pub fn initialize(env: Env, merchant: Address, token: Address, amount: i128, interval: u64) {
+        if env.storage().instance().has(&DataKey::Merchant) {
+            panic!("already initialized");
+        }
         merchant.require_auth();
         if amount <= 0 {
             panic!("amount must be positive");
