@@ -5,11 +5,15 @@ A staking contract with proportional reward distribution using the O(1)
 [soroban-forge](https://github.com/soroban-forge-labs/soroban-forge) from the
 `staking` template.
 
+The contract takes separate stake and reward tokens, so it can express
+both "stake token A, earn token B" and the classic single-token setup
+(by passing the same address for both).
+
 ## Features
 
-- `deposit` / `withdraw` — manage your stake
+- `deposit` / `withdraw` — manage your stake (using the stake token)
 - `distribute` — admin injects reward tokens, updating the global accumulator
-- `claim` — withdraw your proportional share of rewards (O(1) per user)
+- `claim` — withdraw your proportional share of rewards (paid in the reward token)
 - `get_pending_reward` — preview rewards before claiming
 
 ## Develop
@@ -21,13 +25,14 @@ stellar contract build
 
 ## Deploy to testnet
 
-The constructor takes `admin` (Address) and `token` (Address of the reward
-token contract):
+The constructor takes `admin` (Address), `stake_token` (Address of the token
+users deposit) and `reward_token` (Address of the token `distribute` pays out).
+Pass the same address for both to get the classic single-token setup.
 
 ```sh
 stellar contract deploy \
   --wasm target/wasm32v1-none/release/staking.wasm \
   --source-account <your-identity> \
   --network testnet \
-  -- --admin <ADMIN_ADDRESS> --token <REWARD_TOKEN_ADDRESS>
+  -- --admin <ADMIN_ADDRESS> --stake-token <STAKE_TOKEN_ADDRESS> --reward-token <REWARD_TOKEN_ADDRESS>
 ```
