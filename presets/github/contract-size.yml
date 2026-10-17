@@ -21,6 +21,8 @@ jobs:
   contract-size:
     name: "{{project_name}}: contract size"
     runs-on: ubuntu-latest
+    # Bounded so a hung run doesn't burn GitHub's 6-hour default.
+    timeout-minutes: 20
     steps:
       # ci-init-step: contract-size/contract-size/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4

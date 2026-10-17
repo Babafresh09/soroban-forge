@@ -18,6 +18,8 @@ jobs:
   coverage:
     name: "{{project_name}}: coverage"
     runs-on: ubuntu-latest
+    # Bounded so a hung run doesn't burn GitHub's 6-hour default.
+    timeout-minutes: 45
     steps:
       # ci-init-step: coverage/coverage/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4

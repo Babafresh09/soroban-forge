@@ -24,6 +24,8 @@ jobs:
   deploy:
     name: "{{project_name}}: deploy to testnet"
     runs-on: ubuntu-latest
+    # Bounded so a hung run doesn't burn GitHub's 6-hour default.
+    timeout-minutes: 20
     environment: testnet
     steps:
       # ci-init-step: testnet-deploy/deploy/checkout

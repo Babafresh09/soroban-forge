@@ -20,6 +20,8 @@ jobs:
   build-and-test:
     name: "{{project_name}}: build & test (${{ matrix.toolchain }})"
     runs-on: ubuntu-latest
+    # Bounded so a hung run doesn't burn GitHub's 6-hour default.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
