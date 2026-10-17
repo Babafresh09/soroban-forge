@@ -153,6 +153,40 @@ fn accumulator_tracks_multiple_distributions_after_withdraw() {
 }
 
 #[test]
+#[should_panic]
+fn deposit_zero_is_rejected() {
+    let env = Env::default();
+    let (staking, _token, _admin, alice, _bob) = setup(&env);
+    staking.deposit(&alice, &0);
+}
+
+#[test]
+#[should_panic]
+fn deposit_negative_is_rejected() {
+    let env = Env::default();
+    let (staking, _token, _admin, alice, _bob) = setup(&env);
+    staking.deposit(&alice, &-1);
+}
+
+#[test]
+#[should_panic]
+fn withdraw_zero_is_rejected() {
+    let env = Env::default();
+    let (staking, _token, _admin, alice, _bob) = setup(&env);
+    staking.deposit(&alice, &1000);
+    staking.withdraw(&alice, &0);
+}
+
+#[test]
+#[should_panic]
+fn withdraw_negative_is_rejected() {
+    let env = Env::default();
+    let (staking, _token, _admin, alice, _bob) = setup(&env);
+    staking.deposit(&alice, &1000);
+    staking.withdraw(&alice, &-1);
+}
+
+#[test]
 fn get_pending_reward_before_claim() {
     let env = Env::default();
     let (staking, _token, _admin, alice, _bob) = setup(&env);
