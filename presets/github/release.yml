@@ -20,9 +20,13 @@ jobs:
   build-and-release:
     name: "{{project_name}}: build wasm & publish release"
     runs-on: ubuntu-latest
+    # Bounded so a hung run doesn't burn GitHub's 6-hour default.
+    timeout-minutes: 60
     steps:
       # ci-init-step: release/build-and-release/checkout
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # ci-init-step: release/build-and-release/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

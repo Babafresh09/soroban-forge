@@ -94,6 +94,17 @@ scaffolding.
   `saved_bytes == 0` as ambiguous. Human output reflects the same distinction
   in its wording. `--quiet` suppresses the report. On budget failure, the
   actual and budgeted sizes are printed.
+  - `--profile <name>`, `--target <triple>`, `--target-dir <dir>` — resolve
+    the wasm from a non-default build path while still deriving its file name
+    from the detected crate name, instead of spelling the whole path out with
+    `--wasm`. Each flag moves one part of the default
+    `<path>/target/wasm32v1-none/release/<crate>.wasm`: the profile directory
+    (`--profile dev` resolves to `debug/`, which is where cargo builds that
+    profile), the target triple, and the target directory (a relative
+    `--target-dir` is taken from the current directory). They say where the
+    build is rather than replacing it, so none of them can be combined with
+    `--wasm`; under `--all`, every contract is resolved against the same
+    layout.
   - `--in-place` — overwrite the input wasm with the optimized bytes and
     remove the intermediate `<stem>.optimized.wasm`, leaving only the original
     filename on disk (holding the optimized bytes). This is the supported way
@@ -126,6 +137,17 @@ scaffolding.
   `[unreachable: <reason>]`, followed by a reachable count; with `--json`,
   each network gains `reachable` plus `latency_ms` or `error`. Refused under
   `--offline`.
+- `soroban-forge network add <name> [--rpc-url <url>] [--passphrase <p>] [--force] [--no-check]`
+  and `soroban-forge network use <name> [--no-check]` — both probe the
+  endpoint they just selected (the same TCP probe as `list --check`, bounded
+  by `--timeout`, default 3s) and print a `warning:` to stderr when it does
+  not respond, so a typo'd or offline URL surfaces here instead of at the next
+  `deploy`/`invoke`/`verify`. The probe never fails the command: the
+  configuration is saved either way, since a network may be set up before it
+  is up. With `--json` the report carries `reachable` plus `latency_ms` or
+  `error` instead of the warning. Pass `--no-check` to skip the probe;
+  `--offline` skips it too (silently — unlike `list --check`, this check is
+  implicit, so it is not an error).
 - `soroban-forge verify <contract-id> [--network <n>]` — compare a deployed
   contract's wasm hash with the local release build; exits `1` on a mismatch.
   See [Contract Verification](contract-verification.md).

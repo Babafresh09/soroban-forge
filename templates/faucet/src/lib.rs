@@ -72,6 +72,30 @@ impl FaucetContract {
         client.transfer(&admin, &env.current_contract_address(), &amount);
     }
 
+    pub fn withdraw(env: Env, amount: i128) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if amount <= 0 {
+            panic!("withdrawal amount must be positive");
+        }
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &admin, &amount);
+    }
+
+    pub fn set_params(env: Env, amount_per_claim: i128, cooldown_seconds: u64) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if amount_per_claim <= 0 {
+            panic!("amount per claim must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AmountPerClaim, &amount_per_claim);
+        env.storage()
+            .instance()
+            .set(&DataKey::CooldownSeconds, &cooldown_seconds);
+    }
+
     /// Claim the fixed dispense amount.
     ///
     /// Requires authorization from `to`. Reverts if `to` claimed within the

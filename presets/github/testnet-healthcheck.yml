@@ -40,9 +40,13 @@ jobs:
   healthcheck:
     name: "{{project_name}}: verify deployed contract"
     runs-on: ubuntu-latest
+    # Bounded so a hung run doesn't burn GitHub's 6-hour default.
+    timeout-minutes: 10
     steps:
       # ci-init-step: testnet-healthcheck/healthcheck/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
 
       # ci-init-step: testnet-healthcheck/healthcheck/install-rust
       - name: Install Rust

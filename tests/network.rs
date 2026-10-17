@@ -35,6 +35,7 @@ fn network_add_rejects_url_without_scheme() {
             "soroban-testnet.stellar.org",
             "--passphrase",
             "My Network",
+            "--no-check",
         ])
         .output()
         .unwrap();
@@ -61,6 +62,7 @@ fn network_add_rejects_url_with_empty_host() {
             "https://",
             "--passphrase",
             "My Network",
+            "--no-check",
         ])
         .output()
         .unwrap();
@@ -87,6 +89,7 @@ fn network_add_accepts_valid_url() {
             "https://my.rpc.example.com",
             "--passphrase",
             "My Network",
+            "--no-check",
         ])
         .output()
         .unwrap();
@@ -117,6 +120,7 @@ fn network_remove_deletes_a_configured_network() {
             "https://my.rpc.example.com",
             "--passphrase",
             "My Network",
+            "--no-check",
         ])
         .output()
         .unwrap();
@@ -186,6 +190,7 @@ fn network_rm_alias_works() {
             "https://rmtest.example.com",
             "--passphrase",
             "Rm Test",
+            "--no-check",
         ])
         .output()
         .unwrap();
@@ -216,6 +221,7 @@ fn network_remove_default_clears_default_and_notifies() {
             "https://def.rpc.example.com",
             "--passphrase",
             "Default Net",
+            "--no-check",
         ])
         .output()
         .unwrap();
@@ -255,6 +261,7 @@ fn network_show_prints_active_network_details() {
             "https://show.rpc.example.com",
             "--passphrase",
             "Show Network Pass",
+            "--no-check",
         ])
         .output()
         .unwrap();
@@ -287,6 +294,7 @@ fn network_current_alias_works_like_show() {
             "https://cur.rpc.example.com",
             "--passphrase",
             "Current Net",
+            "--no-check",
         ])
         .output()
         .unwrap();
@@ -341,6 +349,7 @@ fn network_show_json_output_has_required_fields() {
             "https://json.rpc.example.com",
             "--passphrase",
             "Json Network",
+            "--no-check",
         ])
         .output()
         .unwrap();
@@ -498,4 +507,236 @@ fn network_list_check_refuses_offline_mode() {
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("offline"), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// reachability warning on `network add` / `network use`
+// ---------------------------------------------------------------------------
+
+/// Port 1 on loopback: nothing listens there, so the probe fails fast without
+/// leaving the machine or depending on DNS.
+const UNREACHABLE_RPC_URL: &str = "http://127.0.0.1:1";
+
+/// Add `netname` pointing at the unreachable endpoint, skipping the probe so
+/// the helper itself stays fast.
+fn add_unreachable_network(config_home: &std::path::Path, netname: &str) {
+    let output = forge()
+        .env("XDG_CONFIG_HOME", config_home)
+        .args([
+            "network",
+            "add",
+            netname,
+            "--rpc-url",
+            UNREACHABLE_RPC_URL,
+            "--passphrase",
+            "Unreachable Net",
+            "--no-check",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// `network add` warns about an unreachable endpoint but still succeeds and
+/// still stores the network.
+#[test]
+fn network_add_warns_about_unreachable_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args([
+            "network",
+            "add",
+            "downnet",
+            "--rpc-url",
+            UNREACHABLE_RPC_URL,
+            "--passphrase",
+            "Down Net",
+            "--timeout",
+            "2",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "an unreachable endpoint must warn, not fail: {output:?}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("warning:"), "expected a warning: {stderr}");
+    assert!(stderr.contains("did not respond"), "{stderr}");
+    assert!(stderr.contains(UNREACHABLE_RPC_URL), "{stderr}");
+    assert!(
+        stderr.contains("--no-check"),
+        "expected the skip hint: {stderr}"
+    );
+
+    // The network is saved despite the warning.
+    let list = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args(["network", "list"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(list.stdout).unwrap();
+    assert!(stdout.contains("downnet"), "{stdout}");
+}
+
+/// `--no-check` suppresses the probe entirely.
+#[test]
+fn network_add_no_check_skips_the_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args([
+            "network",
+            "add",
+            "downnet",
+            "--rpc-url",
+            UNREACHABLE_RPC_URL,
+            "--passphrase",
+            "Down Net",
+            "--no-check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("warning:"),
+        "no probe, no warning: {stderr}"
+    );
+}
+
+/// `--offline` also skips the probe — and, unlike `list --check`, does not
+/// turn the command into an error.
+#[test]
+fn network_add_offline_skips_the_probe_without_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args([
+            "--offline",
+            "network",
+            "add",
+            "downnet",
+            "--rpc-url",
+            UNREACHABLE_RPC_URL,
+            "--passphrase",
+            "Down Net",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("warning:"), "{stderr}");
+}
+
+/// `network add --json` carries the probe result instead of printing a warning.
+#[test]
+fn network_add_json_carries_reachability_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args([
+            "--json",
+            "network",
+            "add",
+            "downnet",
+            "--rpc-url",
+            UNREACHABLE_RPC_URL,
+            "--passphrase",
+            "Down Net",
+            "--timeout",
+            "2",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["reachable"], false, "{json}");
+    assert!(json["error"].is_string(), "{json}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("warning:"),
+        "--json carries it instead: {stderr}"
+    );
+}
+
+/// `network use` warns when the network it selects does not respond, and still
+/// records the selection.
+#[test]
+fn network_use_warns_about_unreachable_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    add_unreachable_network(tmp.path(), "downnet");
+
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .current_dir(project.path())
+        .args(["network", "use", "downnet", "--timeout", "2"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "an unreachable endpoint must warn, not fail: {output:?}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("warning:"), "expected a warning: {stderr}");
+    assert!(stderr.contains("did not respond"), "{stderr}");
+
+    // The selection is still recorded in forge.toml.
+    let forge_toml = std::fs::read_to_string(project.path().join("forge.toml")).unwrap();
+    assert!(forge_toml.contains("downnet"), "{forge_toml}");
+}
+
+/// `network use --no-check` skips the probe.
+#[test]
+fn network_use_no_check_skips_the_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    add_unreachable_network(tmp.path(), "downnet");
+
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .current_dir(project.path())
+        .args(["network", "use", "downnet", "--no-check"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("warning:"), "{stderr}");
+}
+
+/// A reachable endpoint produces no warning at all.
+#[cfg(target_os = "linux")]
+#[test]
+fn network_add_reachable_endpoint_is_silent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+
+    let output = forge()
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .args([
+            "network",
+            "add",
+            "upnet",
+            "--rpc-url",
+            &url,
+            "--passphrase",
+            "Up Net",
+            "--timeout",
+            "2",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("warning:"), "{stderr}");
 }
