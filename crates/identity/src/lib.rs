@@ -46,6 +46,10 @@ pub fn store_path() -> Result<PathBuf> {
 }
 
 /// Load the identity store from disk, or return a default empty one.
+///
+/// Safe to call on its own for a read (`list`, `show`). A load whose result is
+/// mutated and saved back belongs inside [`update_store`], which holds the
+/// store lock across the whole sequence.
 pub fn load_store(path: &PathBuf) -> Result<IdentityStore> {
     if !path.is_file() {
         return Ok(IdentityStore::default());
@@ -71,17 +75,64 @@ pub fn save_store(path: &PathBuf, store: &IdentityStore) -> Result<()> {
         .map_err(|e| ForgeError::Other(format!("writing {}: {e}", path.display())))
 }
 
+/// Read the store, let `f` mutate it, and save it back — all with the store
+/// lock held, so a concurrent writer cannot interleave.
+///
+/// Every mutation of `identities.json` goes through here. Calling
+/// `load_store` -> mutate -> `save_store` directly is a lost-update race: two
+/// parallel `identity generate` runs both load the same store, each insert
+/// their own identity, and the second save discards the first — which reported
+/// success and printed a public key that is no longer stored. See
+/// [`soroban_forge_core::lock`] for why the lock is a sibling lock file.
+///
+/// The store is saved only if `f` succeeds, so a rejected mutation (an
+/// existing name without `--force`, say) leaves the file untouched.
+pub fn update_store<T>(
+    path: &PathBuf,
+    f: impl FnOnce(&mut IdentityStore) -> Result<T>,
+) -> Result<T> {
+    soroban_forge_core::lock::with_lock(path, || {
+        let mut store = load_store(path)?;
+        let outcome = f(&mut store)?;
+        save_store(path, &store)?;
+        Ok(outcome)
+    })
+}
+
+/// Generate a new keypair and store it under `name`, returning the stored
+/// identity (`identity generate`).
+///
+/// A name collision is an [`ForgeError::AlreadyExists`] unless `force`. The
+/// collision check and the write share one lock, so two parallel generates
+/// both end up in the store instead of one silently replacing the other.
+pub fn generate_identity(path: &PathBuf, name: &str, force: bool) -> Result<Identity> {
+    update_store(path, |store| {
+        if store.identities.contains_key(name) && !force {
+            return Err(ForgeError::AlreadyExists(PathBuf::from(name)));
+        }
+        let (public_key, secret_key) = generate_keypair();
+        let identity = Identity {
+            public_key,
+            secret_key,
+            funded_on: Vec::new(),
+        };
+        store.identities.insert(name.to_string(), identity.clone());
+        Ok(identity)
+    })
+}
+
 fn remove_identity(path: &PathBuf, name: &str) -> Result<()> {
-    let mut store = load_store(path)?;
-    if store.identities.remove(name).is_none() {
-        return Err(ForgeError::InvalidArgument(format!(
-            "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
-        )));
-    }
-    if store.default.as_deref() == Some(name) {
-        store.default = None;
-    }
-    save_store(path, &store)
+    update_store(path, |store| {
+        if store.identities.remove(name).is_none() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
+            )));
+        }
+        if store.default.as_deref() == Some(name) {
+            store.default = None;
+        }
+        Ok(())
+    })
 }
 
 /// Persist the active identity choice into `forge.toml` in `cwd`.
@@ -227,6 +278,10 @@ pub fn import_identity(
     let identity = Identity {
         public_key,
         secret_key: secret.trim().to_string(),
+        // Unrelated to locking: `funded_on` (#287) and `import_identity`
+        // (#421) landed in separate branches and the merge left this
+        // initializer without the new field, so the crate did not compile.
+        funded_on: Vec::new(),
     };
     store.identities.insert(name.to_string(), identity.clone());
     Ok(identity)
@@ -551,22 +606,8 @@ impl ForgePlugin for IdentityPlugin {
                 let force = sub.get_flag("force");
                 // #288 — only show secret key when explicitly requested
                 let show_secret = sub.get_flag("show-secret");
-                let mut store = load_store(&path)?;
-
-                if store.identities.contains_key(name.as_str()) && !force {
-                    return Err(ForgeError::AlreadyExists(PathBuf::from(name.as_str())));
-                }
-
-                let (public_key, secret_key) = generate_keypair();
-                store.identities.insert(
-                    name.clone(),
-                    Identity {
-                        public_key: public_key.clone(),
-                        secret_key: secret_key.clone(),
-                        funded_on: Vec::new(),
-                    },
-                );
-                save_store(&path, &store)?;
+                let identity = generate_identity(&path, name, force)?;
+                let (public_key, secret_key) = (identity.public_key, identity.secret_key);
 
                 if ctx.json {
                     // #288 — never emit secret key in JSON output unless --show-secret
@@ -603,9 +644,8 @@ impl ForgePlugin for IdentityPlugin {
                     None => read_secret_line(std::io::stdin().lock())?,
                 };
 
-                let mut store = load_store(&path)?;
-                let identity = import_identity(&mut store, name, &secret, force)?;
-                save_store(&path, &store)?;
+                let identity =
+                    update_store(&path, |store| import_identity(store, name, &secret, force))?;
 
                 if ctx.json {
                     // Never echo the secret back; the caller already has it.
@@ -710,16 +750,15 @@ impl ForgePlugin for IdentityPlugin {
 
             Some(("use", sub)) => {
                 let name = sub.get_one::<String>("name").unwrap();
-                let mut store = load_store(&path)?;
-
-                if !store.identities.contains_key(name.as_str()) {
-                    return Err(ForgeError::InvalidArgument(format!(
-                        "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
-                    )));
-                }
-
-                store.default = Some(name.clone());
-                save_store(&path, &store)?;
+                update_store(&path, |store| {
+                    if !store.identities.contains_key(name.as_str()) {
+                        return Err(ForgeError::InvalidArgument(format!(
+                            "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
+                        )));
+                    }
+                    store.default = Some(name.clone());
+                    Ok(())
+                })?;
 
                 write_identity_to_forge_toml(&ctx.cwd, name)?;
 
@@ -762,14 +801,18 @@ impl ForgePlugin for IdentityPlugin {
                     }
                 }
 
-                let mut store = load_store(&path)?;
-                let (pubkey, mut funded_on) = {
+                // Read-only, so no lock: the store is locked further down, for
+                // the write-back after friendbot answers. Holding it across an
+                // HTTP call would block every other identity command for the
+                // duration of the request.
+                let store = load_store(&path)?;
+                let pubkey = {
                     let id = store.identities.get(name.as_str()).ok_or_else(|| {
                         ForgeError::InvalidArgument(format!(
                             "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
                         ))
                     })?;
-                    (id.public_key.clone(), id.funded_on.clone())
+                    id.public_key.clone()
                 };
 
                 let net_name = match effective_passphrase {
@@ -784,13 +827,18 @@ impl ForgePlugin for IdentityPlugin {
                 // #287 — fund_friendbot now returns the balance
                 let balance = fund_friendbot(&pubkey, effective_passphrase, ctx.timeout())?;
 
-                if !funded_on.contains(&net_name.to_string()) {
-                    funded_on.push(net_name.to_string());
-                }
-                if let Some(id) = store.identities.get_mut(name.as_str()) {
-                    id.funded_on = funded_on;
-                    save_store(&path, &store)?;
-                }
+                // Re-read under the lock rather than reusing the copy loaded
+                // before the request: another command may have written the
+                // store while friendbot was answering, and that write must not
+                // be rolled back by this one.
+                update_store(&path, |store| {
+                    if let Some(id) = store.identities.get_mut(name.as_str()) {
+                        if !id.funded_on.iter().any(|n| n == net_name) {
+                            id.funded_on.push(net_name.to_string());
+                        }
+                    }
+                    Ok(())
+                })?;
 
                 if ctx.json {
                     let report = serde_json::json!({
@@ -1139,6 +1187,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn two_concurrent_generates_both_end_up_in_the_store() {
+        // The lost-update race: without the store lock, both writers load the
+        // same (empty) store, each insert their own identity, and the second
+        // save overwrites the first — so one of the two identities is missing
+        // afterwards even though both commands reported success.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identities.json");
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = ["alice", "bob"]
+            .into_iter()
+            .map(|name| {
+                let path = path.clone();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    // Line both writers up so they really do contend.
+                    start.wait();
+                    generate_identity(&path, name, false)
+                })
+            })
+            .collect();
+
+        let generated: Vec<Identity> = workers
+            .into_iter()
+            .map(|w| {
+                w.join()
+                    .expect("generate panicked")
+                    .expect("generate failed")
+            })
+            .collect();
+
+        let store = load_store(&path).unwrap();
+        assert_eq!(
+            store.identities.keys().collect::<Vec<_>>(),
+            vec!["alice", "bob"],
+            "a concurrent generate was overwritten: {:?}",
+            store.identities.keys().collect::<Vec<_>>()
+        );
+        // Each command's reported public key is the one actually stored, so
+        // neither run printed a key it then lost.
+        for (name, identity) in ["alice", "bob"].into_iter().zip(&generated) {
+            assert_eq!(store.identities[name].public_key, identity.public_key);
+            assert_eq!(store.identities[name].secret_key, identity.secret_key);
+        }
+    }
+
+    #[test]
+    fn many_concurrent_writers_all_end_up_in_the_store() {
+        // Two writers can race benignly on a lucky schedule; eight generating
+        // at once will not. Also covers the store file going from absent to
+        // present under contention, which is how a parallel script starts.
+        const WRITERS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identities.json");
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let workers: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let path = path.clone();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    generate_identity(&path, &format!("id-{i}"), false)
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker
+                .join()
+                .expect("generate panicked")
+                .expect("generate failed");
+        }
+
+        let store = load_store(&path).unwrap();
+        assert_eq!(
+            store.identities.len(),
+            WRITERS,
+            "stored: {:?}",
+            store.identities.keys()
+        );
+        for i in 0..WRITERS {
+            assert!(
+                store.identities.contains_key(&format!("id-{i}")),
+                "identity id-{i} was overwritten by a concurrent writer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_generate_leaves_the_store_and_the_lock_untouched() {
+        // A name collision must not write anything — and must release the
+        // lock, or every later identity command would block on it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identities.json");
+        let first = generate_identity(&path, "alice", false).unwrap();
+
+        let err = generate_identity(&path, "alice", false).unwrap_err();
+        assert!(matches!(err, ForgeError::AlreadyExists(_)), "{err:?}");
+
+        let store = load_store(&path).unwrap();
+        assert_eq!(store.identities.len(), 1);
+        assert_eq!(store.identities["alice"].public_key, first.public_key);
+        assert!(
+            !soroban_forge_core::lock::lock_path(&path).exists(),
+            "the store was left locked after a rejected generate"
+        );
+
+        // --force replaces it, as before.
+        let forced = generate_identity(&path, "alice", true).unwrap();
+        assert_ne!(forced.public_key, first.public_key);
+        assert_eq!(
+            load_store(&path).unwrap().identities["alice"].public_key,
+            forced.public_key
+        );
+    }
+
     // #287 — fund refuses on mainnet passphrase
     #[test]
     fn fund_friendbot_refuses_mainnet_passphrase() {
@@ -1402,6 +1567,7 @@ mod tests {
         let id = Identity {
             public_key: public.clone(),
             secret_key: secret.clone(),
+            funded_on: Vec::new(),
         };
 
         let hidden = format_show("alice", &id, false);
@@ -1427,6 +1593,7 @@ mod tests {
             Identity {
                 public_key: public.clone(),
                 secret_key: secret.clone(),
+                funded_on: Vec::new(),
             },
         );
         let out = format_list(&store);

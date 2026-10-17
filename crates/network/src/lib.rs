@@ -79,6 +79,10 @@ pub fn store_path() -> Result<PathBuf> {
 }
 
 /// Load the network store from disk, or return a default empty one.
+///
+/// Safe to call on its own for a read (`list`, `show`). A load whose result is
+/// mutated and saved back belongs inside [`update_store`], which holds the
+/// store lock across the whole sequence.
 pub fn load_store(path: &PathBuf) -> Result<NetworkStore> {
     if !path.is_file() {
         return Ok(NetworkStore::default());
@@ -101,6 +105,31 @@ pub fn save_store(path: &PathBuf, store: &NetworkStore) -> Result<()> {
         .map_err(|e| ForgeError::Other(format!("serializing network store: {e}")))?;
     soroban_forge_core::atomic::write_atomic(path, &json)
         .map_err(|e| ForgeError::Other(format!("writing {}: {e}", path.display())))
+}
+
+/// Read the store, let `f` mutate it, and save it back — all with the store
+/// lock held, so a concurrent writer cannot interleave.
+///
+/// `networks.json` has exactly the same read-modify-write pattern as the
+/// identity store, and therefore the same lost-update race: two parallel
+/// `network add` runs both load the same store, each insert their own network,
+/// and the second save discards the first — which reported success. Every
+/// mutation of the network store goes through here, for the same reason
+/// `soroban_forge_identity::update_store` exists; see
+/// [`soroban_forge_core::lock`] for how the lock itself works.
+///
+/// The store is saved only if `f` succeeds, so a rejected mutation (an
+/// existing name without `--force`, say) leaves the file untouched.
+pub fn update_store<T>(
+    path: &PathBuf,
+    f: impl FnOnce(&mut NetworkStore) -> Result<T>,
+) -> Result<T> {
+    soroban_forge_core::lock::with_lock(path, || {
+        let mut store = load_store(path)?;
+        let outcome = f(&mut store)?;
+        save_store(path, &store)?;
+        Ok(outcome)
+    })
 }
 
 /// Resolve a network by name: check the user store first, then fall back to
@@ -578,43 +607,44 @@ impl ForgePlugin for NetworkPlugin {
             Some(("add", sub)) => {
                 let name = sub.get_one::<String>("name").unwrap();
                 let force = sub.get_flag("force");
-                let mut store = load_store(&path)?;
 
-                if store.networks.contains_key(name.as_str()) && !force {
-                    return Err(ForgeError::AlreadyExists(PathBuf::from(name.as_str())));
-                }
-
-                let rpc_url = sub.get_one::<String>("rpc-url").cloned();
-                let passphrase = sub.get_one::<String>("passphrase").cloned();
-
-                // #405 — validate the URL before storing it
-                if let Some(ref url) = rpc_url {
-                    validate_rpc_url(url)?;
-                }
-
-                let preset = well_known(name.as_str());
-
-                let network = match (rpc_url, passphrase, preset) {
-                    (Some(rpc_url), Some(network_passphrase), _) => Network {
-                        rpc_url,
-                        network_passphrase,
-                    },
-                    (rpc_url, passphrase, Some(preset)) => Network {
-                        rpc_url: rpc_url.unwrap_or(preset.rpc_url),
-                        network_passphrase: passphrase.unwrap_or(preset.network_passphrase),
-                    },
-                    _ => {
-                        return Err(ForgeError::InvalidArgument(format!(
-                            "`{name}` is not a well-known network — pass both --rpc-url and --passphrase"
-                        )));
+                let network = update_store(&path, |store| {
+                    if store.networks.contains_key(name.as_str()) && !force {
+                        return Err(ForgeError::AlreadyExists(PathBuf::from(name.as_str())));
                     }
-                };
 
-                store.networks.insert(name.clone(), network.clone());
-                if store.default.is_none() {
-                    store.default = Some(name.clone());
-                }
-                save_store(&path, &store)?;
+                    let rpc_url = sub.get_one::<String>("rpc-url").cloned();
+                    let passphrase = sub.get_one::<String>("passphrase").cloned();
+
+                    // #405 — validate the URL before storing it
+                    if let Some(ref url) = rpc_url {
+                        validate_rpc_url(url)?;
+                    }
+
+                    let preset = well_known(name.as_str());
+
+                    let network = match (rpc_url, passphrase, preset) {
+                        (Some(rpc_url), Some(network_passphrase), _) => Network {
+                            rpc_url,
+                            network_passphrase,
+                        },
+                        (rpc_url, passphrase, Some(preset)) => Network {
+                            rpc_url: rpc_url.unwrap_or(preset.rpc_url),
+                            network_passphrase: passphrase.unwrap_or(preset.network_passphrase),
+                        },
+                        _ => {
+                            return Err(ForgeError::InvalidArgument(format!(
+                                "`{name}` is not a well-known network — pass both --rpc-url and --passphrase"
+                            )));
+                        }
+                    };
+
+                    store.networks.insert(name.clone(), network.clone());
+                    if store.default.is_none() {
+                        store.default = Some(name.clone());
+                    }
+                    Ok(network)
+                })?;
 
                 if ctx.json {
                     let report = serde_json::json!({
@@ -706,19 +736,19 @@ impl ForgePlugin for NetworkPlugin {
 
             Some(("use", sub)) => {
                 let name = sub.get_one::<String>("name").unwrap();
-                let mut store = load_store(&path)?;
+                update_store(&path, |store| {
+                    // #289 — also accept built-in names that aren't in the user store
+                    let network_exists = store.networks.contains_key(name.as_str())
+                        || well_known(name.as_str()).is_some();
+                    if !network_exists {
+                        return Err(ForgeError::InvalidArgument(format!(
+                            "network `{name}` not found (use `soroban-forge network list` to see available networks)"
+                        )));
+                    }
 
-                // #289 — also accept built-in names that aren't in the user store
-                let network_exists =
-                    store.networks.contains_key(name.as_str()) || well_known(name.as_str()).is_some();
-                if !network_exists {
-                    return Err(ForgeError::InvalidArgument(format!(
-                        "network `{name}` not found (use `soroban-forge network list` to see available networks)"
-                    )));
-                }
-
-                store.default = Some(name.clone());
-                save_store(&path, &store)?;
+                    store.default = Some(name.clone());
+                    Ok(())
+                })?;
 
                 // #290 — persist the choice into forge.toml so deploy/invoke/verify pick it up
                 write_network_to_forge_toml(&ctx.cwd, name)?;
@@ -777,28 +807,32 @@ impl ForgePlugin for NetworkPlugin {
             // what's actually stored.
             Some(("remove", sub)) => {
                 let name = sub.get_one::<String>("name").unwrap();
-                let mut store = load_store(&path)?;
 
-                if !store.networks.contains_key(name.as_str()) {
-                    // Distinguish "name is a built-in preset" from "name does not exist"
-                    if well_known(name.as_str()).is_some() {
-                        return Err(ForgeError::InvalidArgument(format!(
-                            "`{name}` is a built-in network preset and cannot be removed (use `network add {name} --force …` to override it)
+                let (removed, no_default_left) = update_store(&path, |store| {
+                    if !store.networks.contains_key(name.as_str()) {
+                        // Distinguish "name is a built-in preset" from "name does not exist"
+                        if well_known(name.as_str()).is_some() {
+                            return Err(ForgeError::InvalidArgument(format!(
+                                "`{name}` is a built-in network preset and cannot be removed (use `network add {name} --force …` to override it)
 hint: built-in presets are listed by `soroban-forge network list` with the [built-in] tag"
+                            )));
+                        }
+                        return Err(ForgeError::InvalidArgument(format!(
+                            "network `{name}` not found in the store (use `soroban-forge network list` to see stored networks)
+hint: only entries you added with `network add` can be removed"
                         )));
                     }
-                    return Err(ForgeError::InvalidArgument(format!(
-                        "network `{name}` not found in the store (use `soroban-forge network list` to see stored networks)
-hint: only entries you added with `network add` can be removed"
-                    )));
-                }
 
-                let removed = store.networks.remove(name.as_str()).expect("checked contains_key above");
-                // If the removed network was the default, clear the default.
-                if store.default.as_deref() == Some(name.as_str()) {
-                    store.default = None;
-                }
-                save_store(&path, &store)?;
+                    let removed = store
+                        .networks
+                        .remove(name.as_str())
+                        .expect("checked contains_key above");
+                    // If the removed network was the default, clear the default.
+                    if store.default.as_deref() == Some(name.as_str()) {
+                        store.default = None;
+                    }
+                    Ok((removed, store.default.is_none()))
+                })?;
 
                 if ctx.json {
                     let report = serde_json::json!({
@@ -811,7 +845,7 @@ hint: only entries you added with `network add` can be removed"
                     println!("removed network `{name}`");
                     println!("  rpc url:    {}", removed.rpc_url);
                     println!("  passphrase: {}", removed.network_passphrase);
-                    if store.default.is_none() {
+                    if no_default_left {
                         println!("  hint: no default network selected (use `soroban-forge network use <name>` to set one)");
                     }
                 }

@@ -46,6 +46,40 @@ default_template = "hello-world"
 override user values independently, so a project can override only its
 network while still inheriting the user's identity and template.
 
+## Identity and network stores
+
+Two more files live next to the user config, written by the `identity` and
+`network` subcommands rather than edited by hand:
+
+| File | Written by |
+|------|------------|
+| `~/.config/soroban-forge/identities.json` | `identity generate`, `identity import`, `identity use`, `identity fund`, `identity remove` |
+| `~/.config/soroban-forge/networks.json` | `network add`, `network use`, `network remove` |
+
+Both honour `XDG_CONFIG_HOME` the same way `config.toml` does.
+
+Every command that changes either file reads it, edits it and writes it back.
+That sequence is serialized with an advisory lock so parallel invocations
+cannot lose each other's writes — without it, two `identity generate` runs
+started at the same time would both read the same store, each add their
+identity, and the second write would silently discard the first, even though
+both commands printed a public key and exited `0`. The same protection covers
+`networks.json`, which is written the same way.
+
+The lock is a `identities.json.lock` / `networks.json.lock` file alongside the
+store, held only for the read-edit-write itself — never across a network call,
+so `identity fund` does not block other commands while friendbot answers. A
+command that cannot take the lock within 10 seconds fails rather than
+overwriting, and names the lock file in its error. A lock file left behind by
+a killed process is ignored (and removed) after 60 seconds, so a crash cannot
+wedge later commands. The lock is advisory: it protects soroban-forge
+invocations from each other, not against another program, or you, editing the
+JSON by hand while a command runs.
+
+The writes themselves are atomic — the store is written to a temporary file in
+the same directory and renamed into place — so an interrupted command leaves
+either the old file or the new one, never a half-written store.
+
 ## `forge.toml` reference
 
 Every key any command actually reads from the optional `forge.toml` project
