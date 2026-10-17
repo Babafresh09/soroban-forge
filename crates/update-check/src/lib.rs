@@ -26,8 +26,9 @@
 //! This is not telemetry: no user data, command arguments, project contents
 //! or identifiers are sent. See `docs/privacy.md`.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::io::IsTerminal;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -82,7 +83,8 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Parse a semver version string, stripping a leading `v` if present.
+/// Parse a semver-like version string, stripping a leading `v` if present,
+/// and return a comparable tuple `(major, minor, patch)`.
 fn parse_version(v: &str) -> Option<semver::Version> {
     let v = v.strip_prefix('v').unwrap_or(v);
     semver::Version::parse(v).ok()
@@ -103,7 +105,7 @@ fn http_get(url: &str) -> Option<String> {
         .args([
             "--silent",
             "--max-time",
-            "5",
+            "2",
             "--user-agent",
             concat!("soroban-forge/", env!("CARGO_PKG_VERSION")),
             url,
@@ -111,17 +113,6 @@ fn http_get(url: &str) -> Option<String> {
         .output();
 
     if let Ok(out) = curl_out {
-        if out.status.success() {
-            return String::from_utf8(out.stdout).ok();
-        }
-    }
-
-    // Fallback: wget
-    let wget_out = std::process::Command::new("wget")
-        .args(["--quiet", "--timeout=5", "--output-document=-", url])
-        .output();
-
-    if let Ok(out) = wget_out {
         if out.status.success() {
             return String::from_utf8(out.stdout).ok();
         }
@@ -152,6 +143,14 @@ pub fn spawn(
         log::debug!("update-check: skipped (disabled via config/env)");
         return None;
     }
+    if std::env::var_os("CI").is_some() {
+        log::debug!("update-check: skipped (CI)");
+        return None;
+    }
+    if !std::io::stderr().is_terminal() {
+        log::debug!("update-check: skipped (non-interactive stderr)");
+        return None;
+    }
     // Honour the SOROBAN_FORGE_NO_UPDATE_CHECK env variable.
     if std::env::var("SOROBAN_FORGE_NO_UPDATE_CHECK")
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
@@ -164,7 +163,48 @@ pub fn spawn(
     let handle = std::thread::spawn(move || -> Option<String> {
         let path = state_path()?;
         let current_secs = now_secs();
-        check_with(&path, RELEASES_API_URL, current_secs, http_get)
+
+        if current_secs.saturating_sub(state.last_checked_secs) < CHECK_INTERVAL_SECS {
+            // Within the throttle window — use cached state to decide whether to hint.
+            log::debug!("update-check: within throttle window, using cached state");
+            return build_hint(state.latest_tag.as_deref());
+        }
+
+        // Record the attempt before fetching so offline commands are throttled too.
+        save_state(
+            &path,
+            &UpdateCheckState {
+                last_checked_secs: current_secs,
+                latest_tag: state.latest_tag.clone(),
+            },
+        );
+
+        // Outside window — fetch from GitHub.
+        log::debug!("update-check: fetching {RELEASES_API_URL}");
+        let body = match http_get(RELEASES_API_URL) {
+            Some(b) => b,
+            None => {
+                log::debug!("update-check: HTTP request failed, skipping");
+                return None;
+            }
+        };
+
+        let release: GhRelease = match serde_json::from_str(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                log::debug!("update-check: failed to parse response: {e}");
+                return None;
+            }
+        };
+
+        // Persist updated state.
+        let new_state = UpdateCheckState {
+            last_checked_secs: current_secs,
+            latest_tag: Some(release.tag_name.clone()),
+        };
+        save_state(&path, &new_state);
+
+        build_hint(Some(&release.tag_name))
     });
 
     Some(handle)
@@ -204,12 +244,21 @@ fn build_hint_for(latest_tag: Option<&str>, current: &str) -> Option<String> {
     if latest_ver <= current_ver {
         return None;
     }
-    let install_command = std::env::current_exe()
-        .ok()
-        .map(|path| install_command_for_path(&path))
-        .unwrap_or(
-            "cargo install --git https://github.com/soroban-forge-labs/soroban-forge soroban-forge",
-        );
+    let executable = std::env::current_exe().ok();
+    let executable = executable
+        .as_ref()
+        .and_then(|path| path.to_str())
+        .unwrap_or_default();
+    let install_command = if executable.contains("Homebrew")
+        || executable.contains("homebrew")
+        || executable.contains("/Cellar/")
+    {
+        "brew upgrade soroban-forge"
+    } else if std::env::var_os("CARGO_BINSTALL").is_some() {
+        "cargo binstall soroban-forge"
+    } else {
+        "cargo install --git https://github.com/soroban-forge-labs/soroban-forge soroban-forge"
+    };
     Some(format!(
         "\nA new version of soroban-forge is available: {tag} (you have v{current})\n\
          Run: {install_command}\n\
@@ -306,10 +355,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_version_preserves_prerelease_ordering() {
-        let prerelease = parse_version("v1.0.0-beta.1").unwrap();
-        let release = parse_version("1.0.0").unwrap();
-        assert!(prerelease < release);
+    fn prerelease_sorts_before_release() {
+        assert!(parse_version("v1.0.0-beta.1") < parse_version("v1.0.0"));
     }
 
     #[test]
