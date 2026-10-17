@@ -25,6 +25,8 @@ jobs:
     steps:
       # ci-init-step: security-scan/cargo-audit/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
       # ci-init-step: security-scan/cargo-audit/install-rust
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
@@ -43,6 +45,8 @@ jobs:
     steps:
       # ci-init-step: security-scan/cargo-deny/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
       # ci-init-step: security-scan/cargo-deny/install-cargo-deny
       - name: Install cargo-deny
         uses: EmbarkStudios/cargo-deny-action@34899fc7ba81ca6268d5947d9b551ddb18e4fb9c  # v2
