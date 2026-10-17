@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 /// How often to hit the GitHub API (24 h expressed in seconds).
 const CHECK_INTERVAL_SECS: u64 = 60 * 60 * 24;
+const WAIT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// GitHub releases API endpoint for the soroban-forge project.
 const RELEASES_API_URL: &str =
@@ -42,7 +43,7 @@ const RELEASES_API_URL: &str =
 /// On-disk state persisted between invocations.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct UpdateCheckState {
-    /// Unix timestamp (seconds) of the last successful check.
+    /// Unix timestamp (seconds) of the last check attempt.
     last_checked_secs: u64,
     /// Latest release tag seen on the last successful check (e.g. `"v0.2.0"`).
     latest_tag: Option<String>,
@@ -59,14 +60,14 @@ fn state_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("soroban-forge").join("update-check.json"))
 }
 
-fn load_state(path: &PathBuf) -> UpdateCheckState {
+fn load_state(path: &Path) -> UpdateCheckState {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_state(path: &PathBuf, state: &UpdateCheckState) {
+fn save_state(path: &Path, state: &UpdateCheckState) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -161,7 +162,6 @@ pub fn spawn(
 
     let handle = std::thread::spawn(move || -> Option<String> {
         let path = state_path()?;
-        let state = load_state(&path);
         let current_secs = now_secs();
 
         if current_secs.saturating_sub(state.last_checked_secs) < CHECK_INTERVAL_SECS {
@@ -214,6 +214,14 @@ pub fn spawn(
 /// stderr. This is a no-op when `handle` is `None`.
 pub fn wait_and_print(handle: Option<std::thread::JoinHandle<Option<String>>>) {
     let Some(handle) = handle else { return };
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !handle.is_finished() {
+        log::debug!("update-check: still running at exit; skipping hint");
+        return;
+    }
     match handle.join() {
         Ok(Some(hint)) => eprintln!("{hint}"),
         Ok(None) => {}
@@ -226,8 +234,11 @@ pub fn wait_and_print(handle: Option<std::thread::JoinHandle<Option<String>>>) {
 /// Build the upgrade hint string if the latest release is newer than the
 /// running binary.
 fn build_hint(latest_tag: Option<&str>) -> Option<String> {
+    build_hint_for(latest_tag, env!("CARGO_PKG_VERSION"))
+}
+
+fn build_hint_for(latest_tag: Option<&str>, current: &str) -> Option<String> {
     let tag = latest_tag?;
-    let current = env!("CARGO_PKG_VERSION");
     let latest_ver = parse_version(tag)?;
     let current_ver = parse_version(current)?;
     if latest_ver <= current_ver {
@@ -253,6 +264,74 @@ fn build_hint(latest_tag: Option<&str>) -> Option<String> {
          Run: {install_command}\n\
          Or disable this check: SOROBAN_FORGE_NO_UPDATE_CHECK=1 (or `[defaults] update_check = false` in forge.toml)"
     ))
+}
+
+fn install_command_for_path(path: &Path) -> &'static str {
+    let components: Vec<_> = path
+        .components()
+        .map(|component| component.as_os_str())
+        .collect();
+    let is_homebrew_path = components
+        .windows(2)
+        .any(|pair| pair[0] == "Cellar" && pair[1] == "soroban-forge")
+        || components
+            .windows(2)
+            .any(|pair| pair[0] == "opt" && pair[1] == "homebrew");
+    if is_homebrew_path {
+        "brew upgrade soroban-forge"
+    } else if components
+        .windows(2)
+        .any(|pair| pair[0] == ".cargo" && pair[1] == "bin")
+    {
+        "cargo binstall soroban-forge"
+    } else {
+        "cargo install --git https://github.com/soroban-forge-labs/soroban-forge soroban-forge"
+    }
+}
+
+fn check_with(
+    path: &Path,
+    url: &str,
+    current_secs: u64,
+    fetch: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    let state = load_state(path);
+    if current_secs.saturating_sub(state.last_checked_secs) < CHECK_INTERVAL_SECS {
+        log::debug!("update-check: within throttle window, using cached state");
+        return build_hint(state.latest_tag.as_deref());
+    }
+
+    save_state(
+        path,
+        &UpdateCheckState {
+            last_checked_secs: current_secs,
+            latest_tag: state.latest_tag,
+        },
+    );
+
+    log::debug!("update-check: fetching {url}");
+    let body = match fetch(url) {
+        Some(body) => body,
+        None => {
+            log::debug!("update-check: HTTP request failed, skipping");
+            return None;
+        }
+    };
+    let release: GhRelease = match serde_json::from_str(&body) {
+        Ok(release) => release,
+        Err(error) => {
+            log::debug!("update-check: failed to parse response: {error}");
+            return None;
+        }
+    };
+    save_state(
+        path,
+        &UpdateCheckState {
+            last_checked_secs: current_secs,
+            latest_tag: Some(release.tag_name.clone()),
+        },
+    );
+    build_hint(Some(&release.tag_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +384,56 @@ mod tests {
         let hint = build_hint(Some("v999.999.999")).unwrap();
         assert!(hint.contains("v999.999.999"));
         assert!(hint.contains("SOROBAN_FORGE_NO_UPDATE_CHECK"));
+    }
+
+    #[test]
+    fn build_hint_fires_for_prerelease_user() {
+        let hint = build_hint_for(Some("v1.0.0"), "1.0.0-beta.1").unwrap();
+        assert!(hint.contains("1.0.0-beta.1"));
+    }
+
+    #[test]
+    fn install_command_matches_binary_path() {
+        assert_eq!(
+            install_command_for_path(Path::new(
+                "/opt/homebrew/Cellar/soroban-forge/0.1.0/bin/soroban-forge"
+            )),
+            "brew upgrade soroban-forge"
+        );
+        assert_eq!(
+            install_command_for_path(Path::new("/opt/homebrew/bin/soroban-forge")),
+            "brew upgrade soroban-forge"
+        );
+        assert_eq!(
+            install_command_for_path(Path::new("/home/user/.cargo/bin/soroban-forge")),
+            "cargo binstall soroban-forge"
+        );
+        assert!(
+            install_command_for_path(Path::new("/usr/local/bin/soroban-forge"))
+                .starts_with("cargo install --git")
+        );
+    }
+
+    #[test]
+    fn failed_fetch_is_throttled_on_second_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("update-check.json");
+        let url = "http://127.0.0.1:1/unreachable";
+        let fetch_count = std::cell::Cell::new(0);
+
+        let fetch = |url: &str| {
+            fetch_count.set(fetch_count.get() + 1);
+            http_get(url)
+        };
+        assert!(check_with(&path, url, 100_000, fetch).is_none());
+        assert!(check_with(&path, url, 100_001, |url| {
+            fetch_count.set(fetch_count.get() + 1);
+            http_get(url)
+        })
+        .is_none());
+
+        assert_eq!(fetch_count.get(), 1);
+        assert_eq!(load_state(&path).last_checked_secs, 100_000);
     }
 
     #[test]

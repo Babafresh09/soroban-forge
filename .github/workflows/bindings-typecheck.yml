@@ -75,3 +75,30 @@ jobs:
       - name: "tsc --noEmit (pinned TypeScript ${{ env.TS_VERSION }})"
         working-directory: ${{ runner.temp }}/smoke/bindings/typescript
         run: npx --yes --package "typescript@${TS_VERSION}" tsc --noEmit
+
+  python-typecheck:
+    name: "bindings py: ${{ matrix.template }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        template: [token, amm, governance]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: wasm32v1-none
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6
+        with:
+          python-version: "3.12"
+      - name: Install Python tooling
+        run: pip install mypy stellar-sdk
+      - name: Build soroban-forge
+        run: cargo build --release --bin soroban-forge
+      - name: Generate and type-check Python bindings
+        run: |
+          ./target/release/soroban-forge new smoke --template "${{ matrix.template }}" --no-git --output-dir "$RUNNER_TEMP"
+          (cd "$RUNNER_TEMP/smoke" && stellar contract build)
+          (cd "$RUNNER_TEMP/smoke" && "$GITHUB_WORKSPACE/target/release/soroban-forge" bindings-py)
+          pip install "$RUNNER_TEMP/smoke/bindings/python"
+          mypy --strict "$RUNNER_TEMP/smoke/bindings/python/client.py"

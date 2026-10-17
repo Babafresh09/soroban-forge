@@ -34,6 +34,11 @@ jobs:
         run: |
           templates=$(./target/release/soroban-forge new --list-templates --json | jq -c '[.[].name]')
           echo "templates=$templates" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: soroban-forge-bin
+          path: target/release/soroban-forge
+          retention-days: 1
   build-examples:
     name: "example: ${{ matrix.template }}"
     needs: build
@@ -52,6 +57,20 @@ jobs:
         with:
           # Key each contract example independently.
           key: ${{ matrix.template }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: soroban-forge-bin
+          path: bin
+      - name: Generate and run initialization guard test
+        run: |
+          chmod +x bin/soroban-forge
+          test_dir=$(mktemp -d)
+          cp -a "examples/${{ matrix.template }}/." "$test_dir/"
+          rm -rf "$test_dir/tests"
+          bin/soroban-forge test-init --path "$test_dir"
+          if [[ -f "$test_dir/tests/forge_init_once.rs" ]]; then
+            cargo +stable test --manifest-path "$test_dir/Cargo.toml" --test forge_init_once
+          fi
       - name: cargo test
         working-directory: examples/${{ matrix.template }}
         run: cargo +stable test

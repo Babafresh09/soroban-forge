@@ -126,16 +126,19 @@ pub fn load_args_file(path: &Path) -> Result<Vec<String>> {
         path.display()
     )))?;
 
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| ForgeError::InvalidArgument(format!(
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        ForgeError::InvalidArgument(format!(
             "args file {} is not valid JSON: {e}",
             path.display()
-        )))?;
+        ))
+    })?;
 
-    let obj = value.as_object().ok_or_else(|| ForgeError::InvalidArgument(format!(
-        "args file {} must be a JSON object mapping argument names to values",
-        path.display()
-    )))?;
+    let obj = value.as_object().ok_or_else(|| {
+        ForgeError::InvalidArgument(format!(
+            "args file {} must be a JSON object mapping argument names to values",
+            path.display()
+        ))
+    })?;
 
     let mut result = Vec::with_capacity(obj.len() * 2);
     for (key, val) in obj {
@@ -270,7 +273,11 @@ fn run_stellar_simulate(
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            Ok(parse_simulation_output(&stdout, &stderr, output.status.success()))
+            Ok(parse_simulation_output(
+                &stdout,
+                &stderr,
+                output.status.success(),
+            ))
         }
     }
 }
@@ -280,7 +287,8 @@ fn run_stellar_simulate(
 ///
 /// This is kept as a pure function so it can be unit-tested without shelling
 /// out. The exact output format varies by stellar-cli version; we apply
-/// heuristics rather than assuming a stable schema.
+/// heuristics rather than assuming a stable schema. Known non-result banner
+/// prefixes are skipped so warnings and progress text cannot shadow the value.
 pub fn parse_simulation_output(stdout: &str, stderr: &str, success: bool) -> SimulationOutput {
     let mut sim = SimulationOutput::default();
 
@@ -308,10 +316,18 @@ pub fn parse_simulation_output(stdout: &str, stderr: &str, success: bool) -> Sim
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed.starts_with("cpu:") || trimmed.starts_with("Cost:") || trimmed.starts_with("cost:") {
+        if trimmed.starts_with("cpu:")
+            || trimmed.starts_with("Cost:")
+            || trimmed.starts_with("cost:")
+        {
             sim.cost = Some(trimmed.to_string());
         } else if trimmed.starts_with("Event:") || trimmed.starts_with("event:") {
             sim.events.push(pretty_print_value(trimmed));
+        } else if ["warning:", "info:", "Simulating"]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+        {
+            continue;
         } else if sim.result.is_empty() {
             // First meaningful line is the return value.
             sim.result = pretty_print_value(trimmed);
@@ -612,7 +628,10 @@ impl ForgePlugin for InvokePlugin {
                 let id = soroban_forge_deploy::lookup_recorded_contract_id(
                     &dir,
                     &soroban_forge_deploy::read_crate_name(&dir).unwrap_or_default(),
-                    &network.network.clone().unwrap_or_else(|| DEFAULT_NETWORK.to_string()),
+                    &network
+                        .network
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_NETWORK.to_string()),
                 )
                 .ok_or_else(|| {
                     ForgeError::InvalidArgument(
@@ -655,8 +674,7 @@ impl ForgePlugin for InvokePlugin {
 
         if simulate {
             // Issue #285: simulate and pretty-print.
-            let sim =
-                run_stellar_simulate(
+            let sim = run_stellar_simulate(
                 &contract_id,
                 &source,
                 &network,
@@ -668,7 +686,10 @@ impl ForgePlugin for InvokePlugin {
 
             if ctx.json {
                 let mut obj = serde_json::Map::new();
-                obj.insert("result".into(), serde_json::Value::String(sim.result.clone()));
+                obj.insert(
+                    "result".into(),
+                    serde_json::Value::String(sim.result.clone()),
+                );
                 if let Some(cost) = &sim.cost {
                     obj.insert("cost".into(), serde_json::Value::String(cost.clone()));
                 }
@@ -676,14 +697,20 @@ impl ForgePlugin for InvokePlugin {
                     obj.insert(
                         "events".into(),
                         serde_json::Value::Array(
-                            sim.events.iter().map(|e| serde_json::Value::String(e.clone())).collect(),
+                            sim.events
+                                .iter()
+                                .map(|e| serde_json::Value::String(e.clone()))
+                                .collect(),
                         ),
                     );
                 }
                 if let Some(err) = &sim.error {
                     obj.insert("error".into(), serde_json::Value::String(err.clone()));
                 }
-                println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap()
+                );
             } else if let Some(err) = &sim.error {
                 eprintln!("simulation failed: {err}");
                 if !sim.events.is_empty() {
@@ -765,8 +792,14 @@ mod tests {
         };
         let configured = NetworkArgs::resolve_with_config(None, None, None, Some(&config));
         assert_eq!(configured.network.as_deref(), Some("mainnet"));
-        assert_eq!(configured.rpc_url.as_deref(), Some("https://configured.example"));
-        assert_eq!(configured.network_passphrase.as_deref(), Some("configured passphrase"));
+        assert_eq!(
+            configured.rpc_url.as_deref(),
+            Some("https://configured.example")
+        );
+        assert_eq!(
+            configured.network_passphrase.as_deref(),
+            Some("configured passphrase")
+        );
 
         let cli = NetworkArgs::resolve_with_config(
             Some("testnet".into()),
@@ -901,7 +934,10 @@ mod tests {
         let path = tmp.path().join("args.json");
         std::fs::write(&path, "not json at all").unwrap();
         let err = load_args_file(&path).unwrap_err();
-        assert!(err.to_string().contains("args.json"), "file named in error: {err}");
+        assert!(
+            err.to_string().contains("args.json"),
+            "file named in error: {err}"
+        );
     }
 
     #[test]
@@ -925,8 +961,10 @@ mod tests {
     #[test]
     fn inline_args_override_file_args() {
         let file_args = vec![
-            "--to".to_string(), "GABC".to_string(),
-            "--amount".to_string(), "50".to_string(),
+            "--to".to_string(),
+            "GABC".to_string(),
+            "--amount".to_string(),
+            "50".to_string(),
         ];
         let inline_args = vec!["--amount".to_string(), "100".to_string()];
         let merged = merge_args(&file_args, &inline_args);
@@ -963,8 +1001,19 @@ mod tests {
         let stdout = "42\ncpu: 123456  mem: 78900\n";
         let sim = parse_simulation_output(stdout, "", true);
         assert_eq!(sim.result, "42");
-        assert!(sim.cost.as_deref().unwrap_or("").contains("cpu:"), "{:?}", sim.cost);
+        assert!(
+            sim.cost.as_deref().unwrap_or("").contains("cpu:"),
+            "{:?}",
+            sim.cost
+        );
         assert!(sim.error.is_none());
+    }
+
+    #[test]
+    fn skips_banner_lines_before_simulation_result() {
+        let sim =
+            parse_simulation_output("warning: deprecated\nSimulating transaction\n42", "", true);
+        assert_eq!(sim.result, "42");
     }
 
     #[test]
@@ -983,9 +1032,13 @@ mod tests {
         assert!(sim.error.is_some(), "error should be captured");
         assert!(
             sim.error.as_deref().unwrap().contains("panicked"),
-            "{:?}", sim.error
+            "{:?}",
+            sim.error
         );
-        assert!(!sim.events.is_empty(), "diagnostic events should be captured");
+        assert!(
+            !sim.events.is_empty(),
+            "diagnostic events should be captured"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1118,14 +1171,12 @@ mod tests {
     // #427 — invoke --source flag is optional
     #[test]
     fn test_invoke_command_source_flag_is_optional() {
-        let matches = InvokePlugin
-            .command()
-            .try_get_matches_from([
-                "invoke",
-                "--simulate",
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "get_balance",
-            ]);
+        let matches = InvokePlugin.command().try_get_matches_from([
+            "invoke",
+            "--simulate",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "get_balance",
+        ]);
         assert!(matches.is_ok(), "invoke must parse without --source");
     }
 }

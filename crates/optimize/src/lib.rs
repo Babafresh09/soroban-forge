@@ -16,6 +16,11 @@
 //! `--all` optimizes every contract crate of a Cargo workspace in one run
 //! (issue #412), and `--compare-to` diffs a run against a report previously
 //! saved with `optimize --json` (issue #418).
+//!
+//! `--profile`, `--target` and `--target-dir` optimize a build that is not
+//! the default `target/wasm32v1-none/release` one — a debug build, another
+//! triple, a shared target directory — without giving up the crate-name
+//! detection that names the file (issue #419).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -89,27 +94,140 @@ fn forge_config_budget(dir: &Path) -> Result<Option<u64>> {
     Ok(config.optimize.and_then(|optimize| optimize.max_size))
 }
 
+/// Target triple `stellar contract build` builds for.
+pub const DEFAULT_TARGET: &str = "wasm32v1-none";
+
+/// Cargo profile `stellar contract build` builds with.
+pub const DEFAULT_PROFILE: &str = "release";
+
+/// Which build output `optimize` resolves: the cargo target directory,
+/// target triple and profile the wasm was written under (issue #419).
+///
+/// The default — `target/wasm32v1-none/release` — is what
+/// `stellar contract build` produces.  `--target-dir`, `--target` and
+/// `--profile` move each part of that path independently, so a debug build
+/// or a build for another triple can be optimized without pointing `--wasm`
+/// at it by hand and losing the crate-name detection that derives the file
+/// name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildLayout {
+    /// `--target-dir`: cargo's target directory.  A relative path resolves
+    /// against the project directory, `<path>/target` when absent.
+    pub target_dir: Option<PathBuf>,
+    /// `--target`: the target triple directory under the target directory.
+    pub target: String,
+    /// `--profile`: the cargo profile, which is not always the directory it
+    /// builds into — cargo writes `dev` output to `debug/`.
+    pub profile: String,
+}
+
+impl Default for BuildLayout {
+    fn default() -> Self {
+        Self {
+            target_dir: None,
+            target: DEFAULT_TARGET.to_string(),
+            profile: DEFAULT_PROFILE.to_string(),
+        }
+    }
+}
+
+impl BuildLayout {
+    /// Read `--target-dir`, `--target` and `--profile` off the command line,
+    /// falling back to the `stellar contract build` defaults.  `--target-dir`
+    /// is joined onto `cwd` like every other path argument.
+    fn from_matches(matches: &ArgMatches, cwd: &Path) -> Self {
+        let default = Self::default();
+        Self {
+            target_dir: matches.get_one::<String>("target-dir").map(|p| cwd.join(p)),
+            target: matches
+                .get_one::<String>("target")
+                .cloned()
+                .unwrap_or(default.target),
+            profile: matches
+                .get_one::<String>("profile")
+                .cloned()
+                .unwrap_or(default.profile),
+        }
+    }
+
+    /// Whether this is still the default `target/wasm32v1-none/release`
+    /// layout, which only the error wording depends on.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Directory cargo writes this layout's build output to for a project at
+    /// `dir`.
+    pub fn output_dir(&self, dir: &Path) -> PathBuf {
+        let target_dir = match &self.target_dir {
+            // `join` keeps an absolute --target-dir as-is and hangs a
+            // relative one off the project directory.
+            Some(path) => dir.join(path),
+            None => dir.join("target"),
+        };
+        target_dir.join(&self.target).join(self.profile_dir())
+    }
+
+    /// Where `crate_name`'s wasm lands under this layout.
+    pub fn locate(&self, dir: &Path, crate_name: &str) -> PathBuf {
+        self.output_dir(dir).join(format!("{crate_name}.wasm"))
+    }
+
+    /// Cargo builds the built-in `dev` profile into `debug/`; every other
+    /// profile, custom ones included, uses its own name.
+    fn profile_dir(&self) -> &str {
+        if self.profile == "dev" {
+            "debug"
+        } else {
+            &self.profile
+        }
+    }
+}
+
 /// Default location `stellar contract build` writes its release wasm to.
 pub fn locate_wasm(dir: &Path, crate_name: &str) -> PathBuf {
-    dir.join("target/wasm32v1-none/release")
-        .join(format!("{crate_name}.wasm"))
+    BuildLayout::default().locate(dir, crate_name)
+}
+
+/// Why nothing is where `layout` says the build should be.  The default
+/// layout points at `stellar contract build`; a `--profile`/`--target` one
+/// cannot, since only the caller knows how that build is produced.
+fn missing_build(wasm_path: &Path, layout: &BuildLayout) -> String {
+    if layout.is_default() {
+        format!(
+            "no release build found at {} — run `stellar contract build` first",
+            wasm_path.display()
+        )
+    } else {
+        format!(
+            "no {} build found at {} — build that profile and target first",
+            layout.profile,
+            wasm_path.display()
+        )
+    }
 }
 
 /// Resolve which local wasm to optimize: `wasm_override` when given,
-/// otherwise the release build of the cargo project in `dir`.
-pub fn resolve_local_wasm(dir: &Path, wasm_override: Option<&Path>) -> Result<PathBuf> {
+/// otherwise `layout`'s build of the cargo project in `dir` — the
+/// `wasm32v1-none` release build unless `--target-dir`, `--target` or
+/// `--profile` moved it.
+pub fn resolve_local_wasm(
+    dir: &Path,
+    wasm_override: Option<&Path>,
+    layout: &BuildLayout,
+) -> Result<PathBuf> {
     let wasm_path = match wasm_override {
         Some(path) => path.to_path_buf(),
         None => {
             let crate_name = read_crate_name(dir)?;
-            locate_wasm(dir, &crate_name)
+            layout.locate(dir, &crate_name)
         }
     };
 
     if !wasm_path.is_file() {
         return Err(ForgeError::InvalidArgument(format!(
-            "no release build found at {} — run `stellar contract build` first (or pass --wasm)",
-            wasm_path.display()
+            "{} (or pass --wasm)",
+            missing_build(&wasm_path, layout)
         )));
     }
     Ok(wasm_path)
@@ -796,12 +914,16 @@ pub fn discover_contracts(root: &Path) -> Result<Vec<WorkspaceContract>> {
     Ok(contracts)
 }
 
-/// Where a workspace member's release wasm lives: the workspace's shared
-/// `target/` first (cargo's default), then the member's own `target/`.
-pub fn contract_wasm(root: &Path, contract: &WorkspaceContract) -> Option<PathBuf> {
+/// Where a workspace member's wasm lives for `layout`: the workspace's
+/// shared `target/` first (cargo's default), then the member's own.
+pub fn contract_wasm(
+    root: &Path,
+    contract: &WorkspaceContract,
+    layout: &BuildLayout,
+) -> Option<PathBuf> {
     [root, contract.dir.as_path()]
         .into_iter()
-        .map(|dir| locate_wasm(dir, &contract.crate_name))
+        .map(|dir| layout.locate(dir, &contract.crate_name))
         .find(|path| path.is_file())
 }
 
@@ -905,6 +1027,27 @@ impl ForgePlugin for OptimizePlugin {
                     .help("Path to the local .wasm to optimize [default: target/wasm32v1-none/release/<crate>.wasm]"),
             )
             .arg(
+                Arg::new("profile")
+                    .long("profile")
+                    .value_name("NAME")
+                    .help("Cargo profile the wasm was built with [default: release]; `dev` resolves to the debug/ directory cargo builds it into")
+                    .conflicts_with("wasm"),
+            )
+            .arg(
+                Arg::new("target")
+                    .long("target")
+                    .value_name("TRIPLE")
+                    .help("Target triple the wasm was built for [default: wasm32v1-none]")
+                    .conflicts_with("wasm"),
+            )
+            .arg(
+                Arg::new("target-dir")
+                    .long("target-dir")
+                    .value_name("DIR")
+                    .help("Cargo target directory holding the build [default: <path>/target]")
+                    .conflicts_with("wasm"),
+            )
+            .arg(
                 Arg::new("in-place")
                     .long("in-place")
                     .help("Overwrite the input wasm with the optimized bytes and remove the .optimized.wasm file (leaves only the original filename, holding the optimized bytes)")
@@ -949,6 +1092,7 @@ impl ForgePlugin for OptimizePlugin {
             .map(|p| ctx.cwd.join(p))
             .unwrap_or_else(|| ctx.cwd.clone());
         let wasm_override = matches.get_one::<String>("wasm").map(|p| ctx.cwd.join(p));
+        let layout = BuildLayout::from_matches(matches, &ctx.cwd);
 
         let in_place = matches.get_flag("in-place");
         let verbose = ctx.verbose > 0;
@@ -986,12 +1130,13 @@ impl ForgePlugin for OptimizePlugin {
                     verbose,
                     max_size,
                     baseline: baseline_arg.zip(baseline.as_deref()),
+                    layout: &layout,
                 },
                 ctx,
             );
         }
 
-        let wasm_path = resolve_local_wasm(&dir, wasm_override.as_deref())?;
+        let wasm_path = resolve_local_wasm(&dir, wasm_override.as_deref(), &layout)?;
         let mut report = optimize_with(&wasm_path, in_place, verbose)?;
         if let (Some(label), Some(entries)) = (baseline_arg, baseline.as_deref()) {
             let entry = select_baseline(entries, &report).ok_or_else(|| {
@@ -1022,6 +1167,8 @@ struct AllOptions<'a> {
     max_size: Option<u64>,
     /// `(label, entries)` from `--compare-to`.
     baseline: Option<(&'a String, &'a [BaselineEntry])>,
+    /// Which build output to look for, from `--target-dir`/`--target`/`--profile`.
+    layout: &'a BuildLayout,
 }
 
 /// Optimize one workspace contract, applying the comparison and budget.
@@ -1030,10 +1177,10 @@ fn optimize_contract(
     contract: &WorkspaceContract,
     options: &AllOptions<'_>,
 ) -> std::result::Result<OptimizeReport, String> {
-    let wasm = contract_wasm(root, contract).ok_or_else(|| {
-        format!(
-            "no release build found at {} — run `stellar contract build` first",
-            locate_wasm(root, &contract.crate_name).display()
+    let wasm = contract_wasm(root, contract, options.layout).ok_or_else(|| {
+        missing_build(
+            &options.layout.locate(root, &contract.crate_name),
+            options.layout,
         )
     })?;
     let mut report = optimize_with(&wasm, options.in_place, options.verbose)
@@ -1189,8 +1336,121 @@ mod tests {
         )
         .unwrap();
 
-        let err = resolve_local_wasm(tmp.path(), None).unwrap_err();
+        let err = resolve_local_wasm(tmp.path(), None, &BuildLayout::default()).unwrap_err();
         assert!(err.to_string().contains("stellar contract build"), "{err}");
+    }
+
+    // ---- #419: non-default profiles and target paths ----
+
+    /// A cargo project named `my-token` with `rel` in place as its build.
+    fn project_with_build(rel: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-token\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let wasm = tmp.path().join(rel);
+        std::fs::create_dir_all(wasm.parent().unwrap()).unwrap();
+        std::fs::write(&wasm, b"\0asm").unwrap();
+        (tmp, wasm)
+    }
+
+    fn layout(profile: &str) -> BuildLayout {
+        BuildLayout {
+            profile: profile.to_string(),
+            ..BuildLayout::default()
+        }
+    }
+
+    /// The headline of #419: the wasm comes from the requested profile, with
+    /// the file name still derived from the detected crate name.
+    #[test]
+    fn resolves_a_wasm_from_a_non_default_profile() {
+        let (tmp, wasm) = project_with_build("target/wasm32v1-none/debug/my_token.wasm");
+
+        assert_eq!(
+            resolve_local_wasm(tmp.path(), None, &layout("debug")).unwrap(),
+            wasm
+        );
+        // The default layout still only looks at release/.
+        let err = resolve_local_wasm(tmp.path(), None, &BuildLayout::default()).unwrap_err();
+        assert!(err.to_string().contains("release"), "{err}");
+    }
+
+    /// Cargo builds the `dev` profile into `debug/`, so `--profile dev` has
+    /// to resolve there rather than to a `dev/` directory.
+    #[test]
+    fn the_dev_profile_resolves_to_the_debug_directory() {
+        let (tmp, wasm) = project_with_build("target/wasm32v1-none/debug/my_token.wasm");
+
+        assert_eq!(
+            resolve_local_wasm(tmp.path(), None, &layout("dev")).unwrap(),
+            wasm
+        );
+    }
+
+    /// A custom profile keeps its own name, and a custom target triple and
+    /// target directory move the path around it.
+    #[test]
+    fn target_dir_target_and_custom_profile_move_the_build_path() {
+        let (tmp, wasm) = project_with_build("out/wasm32-unknown-unknown/small/my_token.wasm");
+        let moved = BuildLayout {
+            target_dir: Some(PathBuf::from("out")),
+            target: "wasm32-unknown-unknown".to_string(),
+            profile: "small".to_string(),
+        };
+
+        assert_eq!(moved.locate(tmp.path(), "my_token"), wasm);
+        assert_eq!(resolve_local_wasm(tmp.path(), None, &moved).unwrap(), wasm);
+    }
+
+    /// An absolute `--target-dir` (what `run` passes after joining it onto
+    /// the cwd) is used as given, not hung off the project directory.
+    #[test]
+    fn an_absolute_target_dir_is_used_as_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("shared-target");
+        let moved = BuildLayout {
+            target_dir: Some(elsewhere.clone()),
+            ..BuildLayout::default()
+        };
+
+        assert_eq!(
+            moved.locate(Path::new("/proj"), "my_token"),
+            elsewhere.join("wasm32v1-none/release/my_token.wasm")
+        );
+    }
+
+    /// The default layout's error points at `stellar contract build`, which
+    /// only ever produces the release build; a moved one names the profile
+    /// that is missing instead.
+    #[test]
+    fn a_missing_non_default_build_names_the_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+
+        let err = resolve_local_wasm(tmp.path(), None, &layout("debug"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no debug build found"), "{err}");
+        assert!(err.contains("demo.wasm"), "{err}");
+        assert!(!err.contains("stellar contract build"), "{err}");
+    }
+
+    #[test]
+    fn the_default_layout_is_the_stellar_contract_build_output() {
+        let default = BuildLayout::default();
+        assert!(default.is_default());
+        assert_eq!(
+            default.locate(Path::new("/proj"), "my_token"),
+            PathBuf::from("/proj/target/wasm32v1-none/release/my_token.wasm")
+        );
+        assert!(!layout("debug").is_default());
     }
 
     #[test]
@@ -1200,7 +1460,7 @@ mod tests {
         std::fs::write(&custom, b"\0asm").unwrap();
 
         assert_eq!(
-            resolve_local_wasm(tmp.path(), Some(&custom)).unwrap(),
+            resolve_local_wasm(tmp.path(), Some(&custom), &BuildLayout::default()).unwrap(),
             custom
         );
     }
@@ -1803,15 +2063,33 @@ mod tests {
         let contracts = discover_contracts(root).unwrap();
         let pool = &contracts[0];
 
-        assert_eq!(contract_wasm(root, pool), None);
+        let layout = BuildLayout::default();
+        assert_eq!(contract_wasm(root, pool, &layout), None);
 
         let member_target = locate_wasm(&pool.dir, "pool");
         write(&member_target, "\0asm");
-        assert_eq!(contract_wasm(root, pool), Some(member_target));
+        assert_eq!(contract_wasm(root, pool, &layout), Some(member_target));
 
         let shared = locate_wasm(root, "pool");
         write(&shared, "\0asm");
-        assert_eq!(contract_wasm(root, pool), Some(shared));
+        assert_eq!(contract_wasm(root, pool, &layout), Some(shared));
+    }
+
+    /// #419: --all resolves every contract under the same layout, so
+    /// --profile applies to a whole workspace run too.
+    #[test]
+    fn contract_wasm_follows_a_non_default_profile() {
+        let tmp = workspace_fixture();
+        let root = tmp.path();
+        let pool = &discover_contracts(root).unwrap()[0];
+        let debug = layout("debug");
+
+        write(&locate_wasm(root, "pool"), " asm");
+        assert_eq!(contract_wasm(root, pool, &debug), None);
+
+        let debug_wasm = debug.locate(root, "pool");
+        write(&debug_wasm, " asm");
+        assert_eq!(contract_wasm(root, pool, &debug), Some(debug_wasm));
     }
 
     #[test]
@@ -1851,6 +2129,50 @@ mod tests {
         let help = OptimizePlugin.command().render_long_help().to_string();
         assert!(help.contains("--all"), "{help}");
         assert!(help.contains("--compare-to"), "{help}");
+    }
+
+    #[test]
+    fn help_documents_the_build_path_flags() {
+        let help = OptimizePlugin.command().render_long_help().to_string();
+        for flag in ["--profile", "--target ", "--target-dir"] {
+            assert!(help.contains(flag), "{flag} missing from help:\n{help}");
+        }
+    }
+
+    /// `--profile`/`--target`/`--target-dir` describe where to find the
+    /// default build; `--wasm` replaces it outright, so the two are mutually
+    /// exclusive rather than one silently ignoring the other.
+    #[test]
+    fn the_build_path_flags_conflict_with_wasm() {
+        for flag in ["--profile", "--target", "--target-dir"] {
+            let err = OptimizePlugin
+                .command()
+                .try_get_matches_from(["optimize", flag, "x", "--wasm", "x.wasm"])
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_build_path_flags_default_to_the_release_build() {
+        let matches = OptimizePlugin
+            .command()
+            .try_get_matches_from(["optimize"])
+            .unwrap();
+        assert!(BuildLayout::from_matches(&matches, Path::new("/cwd")).is_default());
+
+        let matches = OptimizePlugin
+            .command()
+            .try_get_matches_from(["optimize", "--profile", "dev", "--target-dir", "out"])
+            .unwrap();
+        let layout = BuildLayout::from_matches(&matches, Path::new("/cwd"));
+        assert_eq!(layout.profile, "dev");
+        assert_eq!(layout.target, DEFAULT_TARGET);
+        assert_eq!(layout.target_dir, Some(PathBuf::from("/cwd/out")));
     }
 
     #[test]
