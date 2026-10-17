@@ -80,17 +80,28 @@ impl DutchAuctionContract {
             panic!("duration must be positive");
         }
 
-        let now = env.ledger().timestamp();
-
         env.storage().instance().set(&DataKey::Seller, &seller);
-        env.storage().instance().set(&DataKey::AssetToken, &asset_token);
-        env.storage().instance().set(&DataKey::PaymentToken, &payment_token);
-        env.storage().instance().set(&DataKey::AssetAmount, &asset_amount);
-        env.storage().instance().set(&DataKey::StartPrice, &start_price);
-        env.storage().instance().set(&DataKey::FloorPrice, &floor_price);
-        env.storage().instance().set(&DataKey::StartTime, &now);
-        env.storage().instance().set(&DataKey::Duration, &duration_seconds);
-        env.storage().instance().set(&DataKey::State, &AuctionState::Pending);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetToken, &asset_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentToken, &payment_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetAmount, &asset_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::StartPrice, &start_price);
+        env.storage()
+            .instance()
+            .set(&DataKey::FloorPrice, &floor_price);
+        env.storage()
+            .instance()
+            .set(&DataKey::Duration, &duration_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey::State, &AuctionState::Pending);
     }
 
     /// Deposit the asset tokens into the auction contract to open the auction.
@@ -115,7 +126,12 @@ impl DutchAuctionContract {
         let client = token::Client::new(&env, &asset_token);
         client.transfer(&seller, &env.current_contract_address(), &asset_amount);
 
-        env.storage().instance().set(&DataKey::State, &AuctionState::Open);
+        env.storage()
+            .instance()
+            .set(&DataKey::StartTime, &env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::State, &AuctionState::Open);
     }
 
     /// Calculate and return the current price based on elapsed time.
@@ -164,7 +180,11 @@ impl DutchAuctionContract {
         let current_price = Self::get_current_price(env.clone());
 
         let seller: Address = env.storage().instance().get(&DataKey::Seller).unwrap();
-        let payment_token: Address = env.storage().instance().get(&DataKey::PaymentToken).unwrap();
+        let payment_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentToken)
+            .unwrap();
         let asset_token: Address = env.storage().instance().get(&DataKey::AssetToken).unwrap();
         let asset_amount: i128 = env.storage().instance().get(&DataKey::AssetAmount).unwrap();
 
@@ -176,9 +196,13 @@ impl DutchAuctionContract {
         let asset_client = token::Client::new(&env, &asset_token);
         asset_client.transfer(&env.current_contract_address(), &buyer, &asset_amount);
 
-        env.storage().instance().set(&DataKey::State, &AuctionState::Settled);
+        env.storage()
+            .instance()
+            .set(&DataKey::State, &AuctionState::Settled);
         env.storage().instance().set(&DataKey::Buyer, &buyer);
-        env.storage().instance().set(&DataKey::SettledPrice, &current_price);
+        env.storage()
+            .instance()
+            .set(&DataKey::SettledPrice, &current_price);
 
         current_price
     }
@@ -205,7 +229,9 @@ impl DutchAuctionContract {
         let asset_client = token::Client::new(&env, &asset_token);
         asset_client.transfer(&env.current_contract_address(), &seller, &asset_amount);
 
-        env.storage().instance().set(&DataKey::State, &AuctionState::Canceled);
+        env.storage()
+            .instance()
+            .set(&DataKey::State, &AuctionState::Canceled);
     }
 
     /// Return current state of the auction.

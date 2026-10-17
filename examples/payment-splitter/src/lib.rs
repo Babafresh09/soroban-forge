@@ -200,10 +200,9 @@ impl PaymentSplitterContract {
 
     /// Everything ever deposited.
     pub fn total_received(env: Env) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::TotalReceived)
-            .unwrap()
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        token::Client::new(&env, &token).balance(&env.current_contract_address())
+            + Self::total_released(env)
     }
 
     /// Everything ever withdrawn by payees.
