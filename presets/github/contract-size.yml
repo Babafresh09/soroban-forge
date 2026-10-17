@@ -26,6 +26,8 @@ jobs:
     steps:
       # ci-init-step: contract-size/contract-size/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
       # ci-init-step: contract-size/contract-size/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
@@ -83,6 +85,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           clean: false
+          persist-credentials: false
 
       # ci-init-step: contract-size/contract-size/build-base-contract
       - name: Build contract (base branch)

@@ -24,6 +24,8 @@ jobs:
     steps:
       # ci-init-step: actionlint/actionlint/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
       # ci-init-step: actionlint/actionlint/install-actionlint
       - name: Install actionlint
         run: |

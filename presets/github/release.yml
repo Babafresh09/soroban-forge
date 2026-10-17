@@ -25,6 +25,8 @@ jobs:
     steps:
       # ci-init-step: release/build-and-release/checkout
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # ci-init-step: release/build-and-release/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
