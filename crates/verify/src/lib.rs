@@ -35,10 +35,13 @@ pub const DEFAULT_NETWORK: &str = "testnet";
 /// Pinned image (by digest) used by `verify --reproducible` to build the
 /// contract before hashing it. Pinned by digest so the hash we compare
 /// against is independent of the local toolchain — same image produces the
-/// same bytes for the same source. See `docs/reproducible-builds.md` for how
-/// to refresh the pin.
-pub const REPRODUCIBLE_IMAGE: &str =
-    "ghcr.io/stellar/soroban-build@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+/// same bytes for the same source.
+///
+/// This is the official `stellar/stellar-cli` image (tag `26.1.0`), the only
+/// image the Stellar Development Foundation publishes that carries both the
+/// `stellar` binary and the `wasm32v1-none` target soroban-forge builds
+/// against. See `docs/contract-verification.md` for how to refresh the pin.
+pub const REPRODUCIBLE_IMAGE: &str = "docker.io/stellar/stellar-cli@sha256:daed639814911ebcafe181027fe40ab24fa6b5fe24ce0b388f95f1f38f9856ff";
 
 /// Length of a strkey-encoded contract ID (`C` + 55 base32 characters).
 pub const CONTRACT_ID_LEN: usize = 56;
@@ -731,6 +734,31 @@ fn copy_fetched_wasm(fetched: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `docker` arguments that build `dir_str` inside [`REPRODUCIBLE_IMAGE`].
+///
+/// Split out from the spawn so the invocation can be asserted on without a
+/// Docker daemon. `--entrypoint stellar` is passed explicitly: the pinned
+/// image already entrypoints at `stellar`, so naming the binary in the
+/// command would run `stellar stellar contract build`.
+fn reproducible_docker_args(dir_str: &str) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "-v".to_string(),
+        // `stellar contract build` writes `target/` into the mounted tree,
+        // which is also how the wasm reaches the host for hashing, so the
+        // mount cannot be read-only.
+        format!("{dir_str}:/src"),
+        "-w".to_string(),
+        "/src".to_string(),
+        "--entrypoint".to_string(),
+        "stellar".to_string(),
+        REPRODUCIBLE_IMAGE.to_string(),
+        "contract".to_string(),
+        "build".to_string(),
+    ]
+}
+
 /// Run the official soroban build inside the pinned image and return the
 /// resulting wasm path. `stellar contract build` runs inside the container
 /// with `contract_dir` mounted at `/src`; the wasm ends up at
@@ -747,19 +775,7 @@ fn build_reproducible(contract_dir: &Path) -> Result<PathBuf> {
     let host_wasm = locate_wasm(contract_dir, &crate_name);
 
     let mut cmd = std::process::Command::new("docker");
-    cmd.args([
-        "run",
-        "--rm",
-        "-v",
-        // Mount the source read-only so the container cannot mutate the host tree.
-        &format!("{dir_str}:/src:ro"),
-        "-w",
-        "/src",
-        REPRODUCIBLE_IMAGE,
-        "stellar",
-        "contract",
-        "build",
-    ]);
+    cmd.args(reproducible_docker_args(dir_str));
     log::debug!("building reproducible wasm in {REPRODUCIBLE_IMAGE}");
 
     match cmd.output() {
@@ -1482,6 +1498,64 @@ mod tests {
                 "--network-passphrase",
                 "cli-pass",
             ]
+        );
+    }
+
+    /// Digest the constant carried before it was pinned for real; a revert
+    /// to it would make every `--reproducible` run fail at `docker run`.
+    const PLACEHOLDER_DIGEST: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn reproducible_image_is_pinned_to_a_real_digest() {
+        let (repository, digest) = REPRODUCIBLE_IMAGE
+            .split_once('@')
+            .unwrap_or_else(|| panic!("{REPRODUCIBLE_IMAGE} is not pinned by digest"));
+        assert!(
+            repository.contains('/'),
+            "{repository} is not a registry path"
+        );
+        assert_ne!(
+            digest, PLACEHOLDER_DIGEST,
+            "REPRODUCIBLE_IMAGE is back to the all-zero placeholder digest; pin it to a published image (see docs/contract-verification.md)"
+        );
+
+        let hex = digest
+            .strip_prefix("sha256:")
+            .unwrap_or_else(|| panic!("{digest} is not a sha256 digest"));
+        assert_eq!(hex.len(), 64, "{digest} is not 64 hex characters");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "{digest} is not lowercase hex"
+        );
+        assert!(
+            hex.chars().any(|c| c != '0'),
+            "{digest} is an all-zero placeholder"
+        );
+    }
+
+    #[test]
+    fn reproducible_docker_args_build_the_mounted_source() {
+        let args = reproducible_docker_args("/home/dev/contract");
+
+        assert_eq!(args[0], "run");
+        assert!(args.contains(&"--rm".to_string()), "{args:?}");
+        // Mounted writable: the build writes target/ back out to the host.
+        let mount = args.iter().position(|a| a == "-v").unwrap() + 1;
+        assert_eq!(args[mount], "/home/dev/contract:/src");
+        let workdir = args.iter().position(|a| a == "-w").unwrap() + 1;
+        assert_eq!(args[workdir], "/src");
+        // The image entrypoints at `stellar`, so the command must not repeat it.
+        assert_eq!(
+            args[args.iter().position(|a| a == "--entrypoint").unwrap() + 1],
+            "stellar"
+        );
+        assert_eq!(&args[args.len() - 2..], ["contract", "build"]);
+        assert!(args.contains(&REPRODUCIBLE_IMAGE.to_string()), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.contains(PLACEHOLDER_DIGEST)),
+            "the docker invocation still carries the placeholder digest: {args:?}"
         );
     }
 }

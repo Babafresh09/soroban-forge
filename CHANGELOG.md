@@ -73,6 +73,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `soroban-forge verify --reproducible` could never build anything:
+  `REPRODUCIBLE_IMAGE` was an all-zero placeholder digest
+  (`ghcr.io/stellar/soroban-build@sha256:0000…`), a repository that is not
+  published, so every run died at `docker run`. It now pins the official
+  `stellar/stellar-cli` image by digest, mounts the source writable (the
+  build writes `target/`) and sets `--entrypoint stellar` so the image's
+  own entrypoint is not invoked twice; a unit test rejects the placeholder
+  digest so a revert fails in CI
 - `soroban-forge optimize` failures now include `stellar contract optimize`'s
   stderr in the error message instead of only the exit status; under `-v` the
   output still streams live (#417)
