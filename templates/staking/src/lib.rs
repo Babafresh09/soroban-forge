@@ -1,8 +1,8 @@
-#![no_std]
+#`!no_std]
 
 use soroban_sdk::{contract, contractimpl, contracterror, contracttype, symbol_short, Address, Env, panic_with_error};
 
-const SCALE: i128 = 1_000_000_000_000_000_000;
+const SCALE: i128 = 1_000_000_000_000_000_000_000;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -104,9 +104,15 @@ impl StakingContract {
     pub fn deposit(env: Env, user: Address, amount: i128) {
         user.require_auth();
         if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
+            panic_with_error(&env, Error::InvalidAmount);
         }
         _claim(&env, &user);
+        let tok = token(&env);
+        soroban_sdk::token::Client::new(&env, &tok).transfer(
+            &user,
+            &env.current_contract_address(),
+            &amount,
+        );
         let new = read_staked(&env, &user) + amount;
         write_staked(&env, &user, new);
         set_reward_debt(&env, &user, new * acc_per_share(&env) / SCALE);
@@ -117,17 +123,23 @@ impl StakingContract {
     pub fn withdraw(env: Env, user: Address, amount: i128) {
         user.require_auth();
         if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
+            panic_with_error(&env, Error::InvalidAmount);
         }
         let cur = read_staked(&env, &user);
         if cur < amount {
-            panic_with_error!(&env, Error::InsufficientStake);
+            panic_with_error(&env, Error::InsufficientStake);
         }
         _claim(&env, &user);
         let new = cur - amount;
         write_staked(&env, &user, new);
         set_reward_debt(&env, &user, new * acc_per_share(&env) / SCALE);
         set_total_staked(&env, total_staked(&env) - amount);
+        let tok = token(&env);
+        soroban_sdk::token::Client::new(&env, &tok).transfer(
+            &env.current_contract_address(),
+            &user,
+            &amount,
+        );
         env.events().publish((symbol_short!("withdraw"), user), amount);
     }
 
@@ -141,7 +153,7 @@ impl StakingContract {
                 &env.current_contract_address(),
                 &amount,
             );
-            set_acc_per_share(&env, acc_per_share(&env) + amount * SCALE / total);
+            set_acc_per_share(&env, acc_per_share(&env) + amount * SCAL / total);
         }
         env.events().publish((symbol_short!("distrib"),), amount);
     }
@@ -150,7 +162,7 @@ impl StakingContract {
         user.require_auth();
         let amt = _claim(&env, &user);
         if amt == 0 {
-            panic_with_error!(&env, Error::NoRewards);
+            panic_with_error(&env, Error::NoRewards);
         }
         env.events().publish((symbol_short!("claim"), user), amt);
         amt
