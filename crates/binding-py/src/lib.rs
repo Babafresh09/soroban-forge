@@ -190,6 +190,7 @@ struct UnionDef {
 struct EnumDef {
     name: String,
     cases: Vec<(String, i64)>,
+    is_error: bool,
 }
 
 /// Every declared type and entrypoint pulled out of an interface spec.
@@ -288,6 +289,7 @@ fn parse_spec(spec_json: &str) -> Result<Spec> {
             .get("udt_enum_v0")
             .or_else(|| entry.get("udt_error_enum_v0"))
         {
+            let is_error = entry.get("udt_error_enum_v0").is_some();
             let name = e["name"].as_str().unwrap_or_default().to_string();
             let cases = e["cases"]
                 .as_array()
@@ -303,7 +305,11 @@ fn parse_spec(spec_json: &str) -> Result<Spec> {
                         .collect()
                 })
                 .unwrap_or_default();
-            spec.enums.push(EnumDef { name, cases });
+            spec.enums.push(EnumDef {
+                name,
+                cases,
+                is_error,
+            });
         }
     }
     Ok(spec)
@@ -587,7 +593,29 @@ fn render_enum(def: &EnumDef) -> String {
         out.push_str(&format!("    {name} = {value}\n"));
     }
     out.push_str("\n\n");
+    if def.is_error {
+        for (name, value) in &def.cases {
+            out.push_str(&format!(
+                "class {name}Error(ContractError):\n    code = {value}\n\n\n"
+            ));
+        }
+    }
     out
+}
+
+fn render_error_helper(spec: &Spec) -> String {
+    let mut arms = String::new();
+    for def in spec.enums.iter().filter(|def| def.is_error) {
+        for (name, value) in &def.cases {
+            arms.push_str(&format!("        {value}: {name}Error,\n"));
+        }
+    }
+    if arms.is_empty() {
+        return String::new();
+    }
+    format!(
+        "class ContractError(Exception):\n    code: int\n\n\ndef contract_error_from_code(code: int) -> ContractError:\n    error_type = {{\n{arms}    }}.get(code, ContractError)\n    return error_type(f\"contract invocation failed with error code {{code}}\")\n\n\n"
+    )
 }
 
 /// A tagged enum: one dataclass per case (a `values: tuple[...]` field for a
@@ -744,7 +772,7 @@ fn render_entrypoint(ep: &Entrypoint, known: &KnownTypes) -> String {
     };
     let mut out = format!(
         "    def {name}(self, {params}{comma}*, source: str | MuxedAccount = NULL_ACCOUNT, signer: Keypair | None = None) -> AssembledTransaction[{return_ty}]:\n",
-        name = ep.name,
+        name = py_ident(&ep.name),
         params = params.join(", "),
         comma = if params.is_empty() { "" } else { ", " },
     );
@@ -820,6 +848,8 @@ fn render_client_py(spec: &Spec) -> String {
     let known = KnownTypes::from_spec(spec);
     let mut out = CLIENT_PREAMBLE.to_string();
 
+    out.push_str(&render_error_helper(spec));
+
     for def in &spec.enums {
         out.push_str(&render_enum(def));
     }
@@ -853,6 +883,7 @@ pub fn generate_bindings(
     wasm_override: Option<&Path>,
     output: &Path,
     force: bool,
+    package_name: Option<&str>,
 ) -> Result<PathBuf> {
     let wasm_path = resolve_wasm(contract_dir, wasm_override)?;
 
@@ -872,6 +903,18 @@ pub fn generate_bindings(
     std::fs::write(output.join("py.typed"), "").map_err(ForgeError::io(format!(
         "writing {}",
         output.join("py.typed").display()
+    )))?;
+    let distribution_name = package_name.map(str::to_owned).unwrap_or_else(|| {
+        read_crate_name(contract_dir)
+            .unwrap_or_else(|_| "soroban-contract-client".into())
+            .replace('_', "-")
+    });
+    let pyproject = format!(
+        "[build-system]\nrequires = [\"setuptools>=68\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[project]\nname = \"{distribution_name}\"\nversion = \"0.1.0\"\ndependencies = [\"stellar-sdk>=13\"]\n\n[tool.setuptools]\npy-modules = [\"client\"]\n\n[tool.setuptools.package-data]\n\"*\" = [\"py.typed\"]\n"
+    );
+    std::fs::write(output.join("pyproject.toml"), pyproject).map_err(ForgeError::io(format!(
+        "writing {}",
+        output.join("pyproject.toml").display()
     )))?;
 
     Ok(wasm_path)
@@ -906,6 +949,11 @@ impl ForgePlugin for BindingsPyPlugin {
                  `stellar-sdk` package.",
             )
             .arg(
+                Arg::new("package-name")
+                    .long("package-name")
+                    .help("Python distribution name [default: Cargo package name]"),
+            )
+            .arg(
                 Arg::new("path")
                     .long("path")
                     .help("Contract project directory [default: current directory]"),
@@ -938,8 +986,12 @@ impl ForgePlugin for BindingsPyPlugin {
             .map(|p| ctx.cwd.join(p))
             .unwrap_or_else(|| dir.join(DEFAULT_OUTPUT_SUBDIR));
         let force = matches.get_flag("force");
+        let package_name = matches
+            .get_one::<String>("package-name")
+            .map(String::as_str);
 
-        let wasm_path = generate_bindings(&dir, wasm_override.as_deref(), &output, force)?;
+        let wasm_path =
+            generate_bindings(&dir, wasm_override.as_deref(), &output, force, package_name)?;
 
         if ctx.json {
             let report = serde_json::json!({
@@ -952,7 +1004,7 @@ impl ForgePlugin for BindingsPyPlugin {
             println!("  -> {}", output.join("client.py").display());
             println!();
             println!("next steps:");
-            println!("  pip install stellar-sdk");
+            println!("  pip install {}", output.display());
             println!("  python -c 'from client import Client'");
         }
         Ok(())
@@ -997,7 +1049,7 @@ mod tests {
         )
         .unwrap();
         let output = tmp.path().join("bindings/python");
-        let err = generate_bindings(tmp.path(), None, &output, false).unwrap_err();
+        let err = generate_bindings(tmp.path(), None, &output, false, None).unwrap_err();
         assert!(err.to_string().contains("stellar contract build"), "{err}");
     }
 
@@ -1011,7 +1063,7 @@ mod tests {
         let output = tmp.path().join("bindings/python");
         std::fs::create_dir_all(&output).unwrap();
 
-        let err = generate_bindings(tmp.path(), Some(&wasm), &output, false).unwrap_err();
+        let err = generate_bindings(tmp.path(), Some(&wasm), &output, false, None).unwrap_err();
         assert!(matches!(err, ForgeError::AlreadyExists(_)));
     }
 
@@ -1276,6 +1328,32 @@ mod tests {
     }
 
     #[test]
+    fn render_entrypoint_escapes_a_python_keyword_method() {
+        let ep = Entrypoint {
+            name: "from".into(),
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let out = render_entrypoint(&ep, &known(&[]));
+        assert!(out.contains("def from_(self"), "{out}");
+        assert!(out.contains("\"from\""), "{out}");
+    }
+
+    #[test]
+    fn renders_contract_error_exceptions() {
+        let spec = spec_json(
+            r#"[{"udt_error_enum_v0":{"name":"Error","cases":[{"name":"Unauthorized","value":2}]}}]"#,
+        );
+        let out = render_client_py(&spec);
+        assert!(out.contains("class ContractError(Exception):"), "{out}");
+        assert!(
+            out.contains("class UnauthorizedError(ContractError):"),
+            "{out}"
+        );
+        assert!(out.contains("2: UnauthorizedError"), "{out}");
+    }
+
+    #[test]
     fn render_struct_escapes_a_python_keyword_field() {
         let def = StructDef {
             name: "AllowanceKey".into(),
@@ -1324,5 +1402,6 @@ mod tests {
         assert!(help.contains("--wasm"), "{help}");
         assert!(help.contains("--output"), "{help}");
         assert!(help.contains("--force"), "{help}");
+        assert!(help.contains("--package-name"), "{help}");
     }
 }
