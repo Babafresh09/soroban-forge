@@ -11,8 +11,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    Address, Env, Symbol,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, Address,
+    Env, Symbol,
 };
 
 /// A single price observation, matching the shape returned by Reflector's
@@ -35,6 +35,10 @@ pub trait OracleInterface {
 #[repr(u32)]
 pub enum Error {
     PriceUnavailable = 1,
+    StalePrice = 2,
+    InvalidPrice = 3,
+    InvalidDecimals = 4,
+    ArithmeticOverflow = 5,
 }
 
 #[contracttype]
@@ -42,6 +46,7 @@ pub enum DataKey {
     Oracle,
     Asset,
     PriceDecimals,
+    MaxPriceAge,
 }
 
 #[contract]
@@ -54,12 +59,24 @@ impl OracleConsumerContract {
     /// * `oracle` — contract address implementing `lastprice`
     /// * `asset` — the asset symbol to price (e.g. `XLM`)
     /// * `price_decimals` — number of decimals the oracle's price uses
-    pub fn __constructor(env: Env, oracle: Address, asset: Symbol, price_decimals: u32) {
+    pub fn __constructor(
+        env: Env,
+        oracle: Address,
+        asset: Symbol,
+        price_decimals: u32,
+        max_price_age: u64,
+    ) {
+        if price_decimals > 38 {
+            panic_with_error!(&env, Error::InvalidDecimals);
+        }
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         env.storage().instance().set(&DataKey::Asset, &asset);
         env.storage()
             .instance()
             .set(&DataKey::PriceDecimals, &price_decimals);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPriceAge, &max_price_age);
     }
 
     /// Fetch the latest price for the configured asset from the oracle.
@@ -70,7 +87,16 @@ impl OracleConsumerContract {
 
         let client = OracleClient::new(&env, &oracle);
         match client.lastprice(&asset) {
-            Some(data) => data.price,
+            Some(data) => {
+                let max_age: u64 = env.storage().instance().get(&DataKey::MaxPriceAge).unwrap();
+                if env.ledger().timestamp().saturating_sub(data.timestamp) > max_age {
+                    panic_with_error!(&env, Error::StalePrice);
+                }
+                if data.price <= 0 {
+                    panic_with_error!(&env, Error::InvalidPrice);
+                }
+                data.price
+            }
             None => panic_with_error!(&env, Error::PriceUnavailable),
         }
     }
@@ -84,8 +110,13 @@ impl OracleConsumerContract {
             .instance()
             .get(&DataKey::PriceDecimals)
             .unwrap();
-        let scale = 10i128.pow(decimals);
-        (amount * price) / scale
+        let scale = 10i128
+            .checked_pow(decimals)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow));
+        amount
+            .checked_mul(price)
+            .and_then(|value| value.checked_div(scale))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow))
     }
 }
 

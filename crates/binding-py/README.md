@@ -113,3 +113,8 @@ structs and tagged enums with void/single/multi-arity cases (`governance`
 template), and error enums (`amm` template) — checked with `mypy --strict`
 (zero errors) and with real `stellar-sdk` encode/decode round-trips of every
 generated struct and enum shape.
+
+Generated error enums include a common `ContractError` base class and one
+exception class per variant. Convert an invocation error code with
+`contract_error_from_code(code)` and catch the generated variant, for example
+`except UnauthorizedError:`.

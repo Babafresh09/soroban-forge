@@ -54,8 +54,18 @@ impl EscrowContract {
         if env.storage().instance().has(&DataKey::Depositor) {
             panic!("already initialized");
         }
-        env.storage().instance().set(&DataKey::Depositor, &depositor);
-        env.storage().instance().set(&DataKey::Recipient, &recipient);
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+        if timeout <= env.ledger().sequence() {
+            panic!("timeout must be a future absolute ledger sequence");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Depositor, &depositor);
+        env.storage()
+            .instance()
+            .set(&DataKey::Recipient, &recipient);
         env.storage().instance().set(&DataKey::Approver, &approver);
         env.storage().instance().set(&DataKey::TokenId, &token_id);
         env.storage().instance().set(&DataKey::Amount, &amount);
