@@ -6,6 +6,7 @@
 //! - argument parsing and command routing ([`cli`])
 //! - the plugin interface that every feature module implements ([`plugin`])
 //! - `forge.toml` config loading ([`config`])
+//! - crash-safe ([`atomic`]) and concurrency-safe ([`lock`]) store writes
 //! - shared error types ([`error`]) and the template renderer ([`render`])
 //!
 //! Feature modules (scaffold, testgen, ci-presets, doctor) depend on this
@@ -17,6 +18,7 @@ pub mod cli;
 pub mod config;
 pub mod config_cmd;
 pub mod error;
+pub mod lock;
 pub mod logging;
 pub mod plugin;
 pub mod render; // template renderer
