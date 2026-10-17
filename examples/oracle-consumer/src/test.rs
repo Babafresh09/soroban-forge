@@ -29,7 +29,7 @@ fn setup(env: &Env) -> (OracleConsumerContractClient<'_>, Address, Symbol) {
 
     let consumer_id = env.register(
         OracleConsumerContract,
-        (oracle_id.clone(), asset.clone(), 14_u32),
+        (oracle_id.clone(), asset.clone(), 14_u32, 3_600_u64),
     );
 
     (
@@ -69,7 +69,7 @@ fn get_price_panics_when_the_oracle_has_no_data() {
 
     let consumer_id = env.register(
         OracleConsumerContract,
-        (oracle_id, asset, 14_u32),
+        (oracle_id, asset, 14_u32, 3_600_u64),
     );
     let consumer = OracleConsumerContractClient::new(&env, &consumer_id);
 
