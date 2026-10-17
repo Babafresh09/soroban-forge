@@ -118,6 +118,17 @@ fn http_get(url: &str) -> Option<String> {
         }
     }
 
+    // Fallback: wget
+    let wget_out = std::process::Command::new("wget")
+        .args(["--quiet", "--timeout=5", "--output-document=-", url])
+        .output();
+
+    if let Ok(out) = wget_out {
+        if out.status.success() {
+            return String::from_utf8(out.stdout).ok();
+        }
+    }
+
     None
 }
 

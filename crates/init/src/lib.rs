@@ -35,34 +35,49 @@ fn manifest_project(dir: &Path) -> Result<Project> {
         path: path.clone(),
         message: err.to_string(),
     })?;
-    let package = manifest
-        .get("package")
-        .and_then(toml::Value::as_table)
-        .ok_or_else(|| {
-            ForgeError::InvalidArgument(format!(
-                "{} does not contain a [package] table",
-                path.display()
-            ))
-        })?;
+    let package = manifest.get("package").and_then(toml::Value::as_table);
+    let workspace = manifest.get("workspace").and_then(toml::Value::as_table);
+    let workspace_package = workspace
+        .and_then(|value| value.get("package"))
+        .and_then(toml::Value::as_table);
     let name = package
-        .get("name")
+        .and_then(|value| value.get("name"))
         .and_then(toml::Value::as_str)
+        .or_else(|| {
+            workspace
+                .and_then(|value| value.get("metadata"))
+                .and_then(|value| value.get("name"))
+                .and_then(toml::Value::as_str)
+        })
+        .map(ToString::to_string)
+        .or_else(|| {
+            dir.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
         .ok_or_else(|| ForgeError::Config {
             path: path.clone(),
-            message: "[package].name must be a string".into(),
-        })?
-        .to_string();
-    let authors = package
-        .get("authors")
-        .and_then(toml::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+            message: "could not determine project name".into(),
+        })?;
+    let package_authors = package.and_then(|value| value.get("authors"));
+    let inherited_authors = package_authors
+        .and_then(toml::Value::as_table)
+        .and_then(|value| value.get("workspace"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let authors = if inherited_authors {
+        workspace_package.and_then(|value| value.get("authors"))
+    } else {
+        package_authors
+    }
+    .and_then(toml::Value::as_array)
+    .map(|values| {
+        values
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(ToString::to_string)
+            .collect()
+    })
+    .unwrap_or_default();
 
     Ok(Project { name, authors })
 }
@@ -112,6 +127,45 @@ impl ForgePlugin for InitPlugin {
                     .action(ArgAction::SetTrue)
                     .help("Also add the default GitHub CI workflows"),
             )
+            .arg(
+                Arg::new("provider")
+                    .long("provider")
+                    .default_value("github"),
+            )
+            .arg(Arg::new("deploy").long("deploy").action(ArgAction::SetTrue))
+            .arg(
+                Arg::new("security-scan")
+                    .long("security-scan")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("coverage")
+                    .long("coverage")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("actionlint")
+                    .long("actionlint")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("healthcheck")
+                    .long("healthcheck")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(Arg::new("matrix").long("matrix").action(ArgAction::SetTrue))
+            .arg(Arg::new("stale").long("stale").action(ArgAction::SetTrue))
+            .arg(
+                Arg::new("dependabot")
+                    .long("dependabot")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(Arg::new("msrv").long("msrv"))
+            .arg(
+                Arg::new("max-size")
+                    .long("max-size")
+                    .value_parser(clap::value_parser!(u64)),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -134,15 +188,42 @@ impl ForgePlugin for InitPlugin {
 
         let mut ci_files = Vec::new();
         if matches.get_flag("ci") {
-            ci_files = soroban_forge_ci_presets::generate(
-                &dir,
-                "github",
-                &project.name,
-                false,
-                false,
-                &GenerateOptions::default(),
-                false,
+            let options = GenerateOptions {
+                deploy: matches.get_flag("deploy"),
+                security_scan: matches.get_flag("security-scan"),
+                coverage: matches.get_flag("coverage"),
+                actionlint: matches.get_flag("actionlint"),
+                healthcheck: matches.get_flag("healthcheck"),
+                matrix: matches.get_flag("matrix"),
+                stale: matches.get_flag("stale"),
+                dependabot: matches.get_flag("dependabot"),
+                msrv: matches.get_one::<String>("msrv").cloned(),
+                max_size: matches.get_one::<u64>("max-size").copied(),
+            };
+            let providers = soroban_forge_ci_presets::parse_providers(
+                matches
+                    .get_one::<String>("provider")
+                    .expect("default provider"),
             )?;
+            for provider in providers {
+                match soroban_forge_ci_presets::generate(
+                    &dir,
+                    &provider,
+                    &project.name,
+                    options.deploy,
+                    false,
+                    &options,
+                    false,
+                ) {
+                    Ok(files) => ci_files.extend(files),
+                    Err(error) => {
+                        for file in test_files.iter().chain(ci_files.iter()) {
+                            let _ = std::fs::remove_file(dir.join(file));
+                        }
+                        return Err(error);
+                    }
+                }
+            }
         }
 
         let project_name = initialize(&dir)?;
