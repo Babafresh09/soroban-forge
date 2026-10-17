@@ -24,6 +24,8 @@ permissions:
 jobs:
   stale:
     runs-on: ubuntu-latest
+    # Bounded so a hung run doesn't burn GitHub's 6-hour default.
+    timeout-minutes: 10
     steps:
       # ci-init-step: stale/stale/stale-action
       - uses: actions/stale@v9

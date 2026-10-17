@@ -17,6 +17,8 @@ jobs:
   build-and-test:
     name: "{{project_name}}: build & test"
     runs-on: ubuntu-latest
+    # Bounded so a hung run doesn't burn GitHub's 6-hour default.
+    timeout-minutes: 30
     steps:
       # ci-init-step: build-test/build-and-test/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -46,6 +48,8 @@ jobs:
   lint:
     name: "{{project_name}}: lint (rustfmt + clippy)"
     runs-on: ubuntu-latest
+    # Bounded so a hung run doesn't burn GitHub's 6-hour default.
+    timeout-minutes: 15
     steps:
       # ci-init-step: build-test/lint/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
