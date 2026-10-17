@@ -8,6 +8,11 @@
 //!
 //! `network use <name>` also writes the choice into the project's `forge.toml`
 //! so that `deploy`, `invoke`, and `verify` share a single source of truth.
+//!
+//! `network add` and `network use` probe the selected RPC endpoint and warn
+//! when it does not answer, so a typo'd or offline URL surfaces immediately
+//! instead of at the next `deploy`/`invoke`/`verify`. The probe never fails
+//! the command and is skipped with `--no-check` or `--offline`.
 
 use std::collections::BTreeMap;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -457,6 +462,67 @@ pub fn probe_networks(store: &NetworkStore, timeout: Duration) -> BTreeMap<Strin
         .collect()
 }
 
+// ---- courtesy reachability check on `network add` / `network use` ----
+
+/// Whether `network add`/`network use` should probe the endpoint it just
+/// selected.
+///
+/// The probe is skipped when the caller passed `--no-check`, and under
+/// `--offline`, where no network operation may run at all.  Unlike
+/// `network list --check`, offline is not an error here: this check is
+/// implicit, so the command just saves the configuration without it.
+pub fn should_check_endpoint(ctx: &ForgeContext, no_check: bool) -> bool {
+    !no_check && !ctx.offline
+}
+
+/// The warning printed when the endpoint picked by `add`/`use` does not
+/// respond.
+///
+/// Deliberately a warning and not an error: a network may legitimately be
+/// configured before it is up (a local node that is not running yet, an
+/// endpoint only reachable over a VPN), so the configuration is still saved.
+pub fn unreachable_warning(name: &str, rpc_url: &str, reason: &str) -> String {
+    let mut out = format!("warning: `{name}` endpoint {rpc_url} did not respond ({reason})\n");
+    out.push_str("  the network was saved, but deploy/invoke/verify against it will fail\n");
+    out.push_str("  hint: re-probe with `network list --check`, or pass --no-check to skip");
+    out
+}
+
+/// Probe `rpc_url` and warn on stderr when it does not respond, returning the
+/// result so `--json` output can carry it.  Returns `None` when the check was
+/// skipped (see [`should_check_endpoint`]).
+///
+/// The warning goes to stderr and is not silenced by `--quiet`: it reports a
+/// problem rather than progress.  Under `--json` it is left out, because the
+/// report itself carries the `reachable`/`error` fields.
+pub fn check_endpoint_and_warn(
+    ctx: &ForgeContext,
+    no_check: bool,
+    name: &str,
+    rpc_url: &str,
+) -> Option<Reachability> {
+    if !should_check_endpoint(ctx, no_check) {
+        return None;
+    }
+    let timeout = ctx.timeout().unwrap_or(DEFAULT_CHECK_TIMEOUT);
+    let result = probe_endpoint(rpc_url, timeout);
+    if let Reachability::Unreachable(reason) = &result {
+        if !ctx.json {
+            eprintln!("{}", unreachable_warning(name, rpc_url, reason));
+        }
+    }
+    Some(result)
+}
+
+/// Merge a probe result into a command's `--json` report object.
+fn merge_reachability(report: &mut serde_json::Value, check: Option<&Reachability>) {
+    if let (Some(check), Some(object)) = (check, report.as_object_mut()) {
+        if let serde_json::Value::Object(fields) = check.json_fields() {
+            object.extend(fields);
+        }
+    }
+}
+
 /// Validate that a URL string has a scheme and a non-empty host.
 ///
 /// This is a lightweight check — not a full RFC 3986 parse — but it catches
@@ -528,6 +594,12 @@ impl ForgePlugin for NetworkPlugin {
                             .long("force")
                             .action(clap::ArgAction::SetTrue)
                             .help("Overwrite an existing network with the same name"),
+                    )
+                    .arg(
+                        Arg::new("no-check")
+                            .long("no-check")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Skip the reachability probe of the endpoint (implied by --offline)"),
                     ),
             )
             .subcommand(
@@ -547,6 +619,12 @@ impl ForgePlugin for NetworkPlugin {
                         Arg::new("name")
                             .help("Name of the network to use as default")
                             .required(true),
+                    )
+                    .arg(
+                        Arg::new("no-check")
+                            .long("no-check")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Skip the reachability probe of the endpoint (implied by --offline)"),
                     ),
             )
             // #406 — print the active default network's details (renamed from
@@ -617,16 +695,29 @@ impl ForgePlugin for NetworkPlugin {
                 save_store(&path, &store)?;
 
                 if ctx.json {
-                    let report = serde_json::json!({
+                    let mut report = serde_json::json!({
                         "name": name,
                         "rpc_url": network.rpc_url,
                         "network_passphrase": network.network_passphrase,
                     });
+                    let check = check_endpoint_and_warn(
+                        ctx,
+                        sub.get_flag("no-check"),
+                        name,
+                        &network.rpc_url,
+                    );
+                    merge_reachability(&mut report, check.as_ref());
                     println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                } else if !ctx.quiet {
-                    println!("added network `{name}`");
-                    println!("  rpc url:    {}", network.rpc_url);
-                    println!("  passphrase: {}", network.network_passphrase);
+                } else {
+                    if !ctx.quiet {
+                        println!("added network `{name}`");
+                        println!("  rpc url:    {}", network.rpc_url);
+                        println!("  passphrase: {}", network.network_passphrase);
+                    }
+                    // Warn (never fail) when the endpoint does not answer, so a
+                    // typo'd or offline URL surfaces here instead of at the next
+                    // deploy/invoke/verify.
+                    check_endpoint_and_warn(ctx, sub.get_flag("no-check"), name, &network.rpc_url);
                 }
                 Ok(())
             }
@@ -723,12 +814,27 @@ impl ForgePlugin for NetworkPlugin {
                 // #290 — persist the choice into forge.toml so deploy/invoke/verify pick it up
                 write_network_to_forge_toml(&ctx.cwd, name)?;
 
+                // The selected network always resolves here: `network_exists`
+                // above checked the store and the built-in presets.
+                let rpc_url = resolve_network(&store, name).map(|n| n.rpc_url);
+                let no_check = sub.get_flag("no-check");
+
                 if ctx.json {
-                    let report = serde_json::json!({ "default": name });
+                    let mut report = serde_json::json!({ "default": name });
+                    let check = rpc_url
+                        .as_deref()
+                        .and_then(|url| check_endpoint_and_warn(ctx, no_check, name, url));
+                    merge_reachability(&mut report, check.as_ref());
                     println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                } else if !ctx.quiet {
-                    println!("using `{name}` as the default network");
-                    println!("  recorded in forge.toml and networks.json");
+                } else {
+                    if !ctx.quiet {
+                        println!("using `{name}` as the default network");
+                        println!("  recorded in forge.toml and networks.json");
+                    }
+                    // Warn (never fail) when the endpoint does not answer.
+                    if let Some(url) = rpc_url.as_deref() {
+                        check_endpoint_and_warn(ctx, no_check, name, url);
+                    }
                 }
                 Ok(())
             }
@@ -878,6 +984,89 @@ mod tests {
 
         assert!(well_known("localnet").is_some());
         assert!(well_known("custom-xyz").is_none());
+    }
+
+    // ---- courtesy reachability check on `add`/`use` ----
+
+    /// A probe against a port nothing is listening on reports unreachable
+    /// rather than erroring out.
+    #[test]
+    fn probe_reports_closed_port_as_unreachable() {
+        let result = probe_endpoint("http://127.0.0.1:1", Duration::from_secs(2));
+        assert!(!result.is_reachable(), "{result:?}");
+    }
+
+    /// The warning names the network, the URL and the reason, and points at
+    /// both escape hatches.
+    #[test]
+    fn unreachable_warning_mentions_name_url_and_hint() {
+        let warning = unreachable_warning("mynet", "http://127.0.0.1:1", "connection refused");
+        assert!(warning.starts_with("warning:"), "{warning}");
+        assert!(warning.contains("mynet"), "{warning}");
+        assert!(warning.contains("http://127.0.0.1:1"), "{warning}");
+        assert!(warning.contains("connection refused"), "{warning}");
+        assert!(warning.contains("--no-check"), "{warning}");
+        // The command still succeeded — say so, so the warning is not read
+        // as a failure.
+        assert!(warning.contains("saved"), "{warning}");
+    }
+
+    /// The code path the commands take: an unreachable endpoint comes back as
+    /// `Unreachable` (so the caller warns) and is skipped entirely under
+    /// `--no-check`.
+    #[test]
+    fn check_endpoint_and_warn_reports_unreachable_and_honours_no_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ForgeContext::with_options(
+            dir.path().to_path_buf(),
+            0,
+            false,
+            false,
+            false,
+            false,
+            None,
+            Some(2),
+            None,
+        )
+        .unwrap();
+
+        let result = check_endpoint_and_warn(&ctx, false, "downnet", "http://127.0.0.1:1")
+            .expect("the probe must run");
+        match result {
+            Reachability::Unreachable(reason) => assert!(!reason.is_empty()),
+            other => panic!("expected unreachable, got {other:?}"),
+        }
+
+        assert!(
+            check_endpoint_and_warn(&ctx, true, "downnet", "http://127.0.0.1:1").is_none(),
+            "--no-check must skip the probe"
+        );
+    }
+
+    /// `--no-check` and `--offline` both skip the probe; otherwise it runs.
+    #[test]
+    fn should_check_endpoint_honours_no_check_and_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ForgeContext::new(dir.path().to_path_buf(), 0).unwrap();
+        assert!(should_check_endpoint(&ctx, false));
+        assert!(!should_check_endpoint(&ctx, true), "--no-check must skip");
+
+        let offline = ForgeContext::with_options(
+            dir.path().to_path_buf(),
+            0,
+            false,
+            false,
+            false,
+            true,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !should_check_endpoint(&offline, false),
+            "--offline must skip"
+        );
     }
 
     // #466 — mainnet preset must not contain embedded credentials or API keys

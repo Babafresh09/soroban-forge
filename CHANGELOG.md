@@ -17,6 +17,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `soroban-forge network list --check` probes each configured endpoint and
   annotates which networks are reachable; plain `network list` stays
   offline (#411)
+- `soroban-forge network add` and `network use` probe the endpoint they
+  select and warn when it does not respond, instead of leaving a typo'd or
+  offline RPC URL to surface at the next `deploy`/`invoke`/`verify`. The
+  command still succeeds and still saves the configuration; `--no-check`
+  skips the probe, and `--offline` skips it silently
 - `soroban-forge identity remove <name>` deletes a stored identity and reports
   a clear error when the name is not found (#420)
 - `soroban-forge --list --json` now emits structured `builtin` and `external`

@@ -126,6 +126,17 @@ scaffolding.
   `[unreachable: <reason>]`, followed by a reachable count; with `--json`,
   each network gains `reachable` plus `latency_ms` or `error`. Refused under
   `--offline`.
+- `soroban-forge network add <name> [--rpc-url <url>] [--passphrase <p>] [--force] [--no-check]`
+  and `soroban-forge network use <name> [--no-check]` — both probe the
+  endpoint they just selected (the same TCP probe as `list --check`, bounded
+  by `--timeout`, default 3s) and print a `warning:` to stderr when it does
+  not respond, so a typo'd or offline URL surfaces here instead of at the next
+  `deploy`/`invoke`/`verify`. The probe never fails the command: the
+  configuration is saved either way, since a network may be set up before it
+  is up. With `--json` the report carries `reachable` plus `latency_ms` or
+  `error` instead of the warning. Pass `--no-check` to skip the probe;
+  `--offline` skips it too (silently — unlike `list --check`, this check is
+  implicit, so it is not an error).
 - `soroban-forge verify <contract-id> [--network <n>]` — compare a deployed
   contract's wasm hash with the local release build; exits `1` on a mismatch.
   See [Contract Verification](contract-verification.md).
