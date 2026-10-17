@@ -11,6 +11,7 @@ pub enum Error {
     InsufficientStake = 1,
     NotAdmin = 2,
     NoRewards = 3,
+    InvalidAmount = 4,
 }
 
 #[contracttype]
@@ -102,6 +103,9 @@ impl StakingContract {
 
     pub fn deposit(env: Env, user: Address, amount: i128) {
         user.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
         _claim(&env, &user);
         let new = read_staked(&env, &user) + amount;
         write_staked(&env, &user, new);
@@ -112,6 +116,9 @@ impl StakingContract {
 
     pub fn withdraw(env: Env, user: Address, amount: i128) {
         user.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
         let cur = read_staked(&env, &user);
         if cur < amount {
             panic_with_error!(&env, Error::InsufficientStake);
