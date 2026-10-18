@@ -21,6 +21,12 @@ GitHub Actions workflows into the target project:
 | `release.yml`        | tag `v*.*.*` (`--release`) | builds the wasm, verifies the build is reproducible in a pinned container, attaches it + a SHA256 checksum to a GitHub Release |
 | `testnet-healthcheck.yml` | scheduled or manual (`--healthcheck`) | builds the project and runs `soroban-forge verify <contract-id>` against a configured network |
 
+`soroban-forge ci-init --provider jenkins` writes a declarative `Jenkinsfile`
+at the repository root. Its stages install the stable Rust toolchain and
+`wasm32v1-none` target, build the contract, run `cargo test`, and fail if any
+generated wasm exceeds `--max-size` (default: 65,536 bytes). Jenkins agents must
+have `rustup` installed and a POSIX shell available.
+
 `--dependabot` additionally writes `.github/dependabot.yml` (weekly `cargo`
 and `github-actions` updates). It is a config file, not a workflow, so it
 lands in `.github/` rather than `.github/workflows/`.
@@ -74,7 +80,7 @@ survive rendering verbatim (guaranteed by core's renderer — unknown
 placeholders pass through).
 
 Adding a provider = new `presets/<name>/` directory + an arm in
-`output_dir()` mapping it to the right path (e.g. `.gitlab-ci.yml`).
+`output_dir()` mapping it to the right path (e.g. `Jenkinsfile` at `.`).
 
 ## Release workflow
 

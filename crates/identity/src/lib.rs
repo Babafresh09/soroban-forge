@@ -106,11 +106,32 @@ pub fn update_store<T>(
 /// collision check and the write share one lock, so two parallel generates
 /// both end up in the store instead of one silently replacing the other.
 pub fn generate_identity(path: &PathBuf, name: &str, force: bool) -> Result<Identity> {
+    generate_identity_with(path, name, force, || Ok(generate_keypair()))
+}
+
+/// Derive and store a Stellar identity from a BIP-39 mnemonic using the
+/// Stellar Ed25519 path `m/44'/148'/index'`.
+pub fn generate_identity_from_mnemonic(
+    path: &PathBuf,
+    name: &str,
+    force: bool,
+    mnemonic: &str,
+    index: u32,
+) -> Result<Identity> {
+    generate_identity_with(path, name, force, || derive_keypair_from_mnemonic(mnemonic, index))
+}
+
+fn generate_identity_with(
+    path: &PathBuf,
+    name: &str,
+    force: bool,
+    derive: impl FnOnce() -> Result<(String, String)>,
+) -> Result<Identity> {
     update_store(path, |store| {
         if store.identities.contains_key(name) && !force {
             return Err(ForgeError::AlreadyExists(PathBuf::from(name)));
         }
-        let (public_key, secret_key) = generate_keypair();
+        let (public_key, secret_key) = derive()?;
         let identity = Identity {
             public_key,
             secret_key,
@@ -201,6 +222,61 @@ pub fn generate_keypair() -> (String, String) {
     let public = PublicKey(pubkey).to_string();
     let secret = PrivateKey(seed).to_string();
     (public, secret)
+}
+
+/// Derive a Stellar keypair from a BIP-39 mnemonic and account index.
+///
+/// Uses BIP-39's empty passphrase and SLIP-0010 hardened Ed25519 derivation
+/// along Stellar's standard `m/44'/148'/index'` path. The input phrase is
+/// never included in returned errors.
+pub fn derive_keypair_from_mnemonic(mnemonic: &str, index: u32) -> Result<(String, String)> {
+    use bip39::Mnemonic;
+    use ed25519_dalek::SigningKey;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    use stellar_strkey::ed25519::{PrivateKey, PublicKey};
+
+    const HARDENED: u32 = 1 << 31;
+    if index >= HARDENED {
+        return Err(ForgeError::InvalidArgument(
+            "mnemonic derivation index must be less than 2^31".into(),
+        ));
+    }
+
+    let phrase = Mnemonic::parse(mnemonic.trim()).map_err(|_| {
+        ForgeError::InvalidArgument("invalid BIP-39 mnemonic phrase".into())
+    })?;
+    let seed = phrase.to_seed("");
+
+    type HmacSha512 = Hmac<Sha512>;
+    let mut master_mac = HmacSha512::new_from_slice(b"ed25519 seed")
+        .map_err(|_| ForgeError::Other("could not initialize mnemonic derivation".into()))?;
+    master_mac.update(&seed);
+    let master = master_mac.finalize().into_bytes();
+
+    let mut private_key = [0u8; 32];
+    private_key.copy_from_slice(&master[..32]);
+    let mut chain_code = [0u8; 32];
+    chain_code.copy_from_slice(&master[32..]);
+
+    for child_index in [44 | HARDENED, 148 | HARDENED, index | HARDENED] {
+        let mut child_data = Vec::with_capacity(37);
+        child_data.push(0);
+        child_data.extend_from_slice(&private_key);
+        child_data.extend_from_slice(&child_index.to_be_bytes());
+
+        let mut child_mac = HmacSha512::new_from_slice(&chain_code)
+            .map_err(|_| ForgeError::Other("could not initialize mnemonic derivation".into()))?;
+        child_mac.update(&child_data);
+        let child = child_mac.finalize().into_bytes();
+        private_key.copy_from_slice(&child[..32]);
+        chain_code.copy_from_slice(&child[32..]);
+    }
+
+    let signing_key = SigningKey::from_bytes(&private_key);
+    let public_key = PublicKey(signing_key.verifying_key().to_bytes()).to_string();
+    let secret_key = PrivateKey(private_key).to_string();
+    Ok((public_key, secret_key))
 }
 
 /// Derive the public key (`G...`) from a Stellar secret key (`S...`) (#421).
@@ -453,6 +529,20 @@ impl ForgePlugin for IdentityPlugin {
                             .action(clap::ArgAction::SetTrue)
                             .help("Overwrite an existing identity with the same name"),
                     )
+                    .arg(
+                        Arg::new("from-mnemonic")
+                            .long("from-mnemonic")
+                            .value_name("MNEMONIC")
+                            .help("Derive a reproducible identity from a BIP-39 mnemonic"),
+                    )
+                    .arg(
+                        Arg::new("index")
+                            .long("index")
+                            .value_name("N")
+                            .value_parser(clap::value_parser!(u32))
+                            .requires("from-mnemonic")
+                            .help("Hardened Stellar account derivation index (default: 0)"),
+                    )
                     // #288 — explicit opt-in to showing secret keys
                     .arg(
                         Arg::new("show-secret")
@@ -566,7 +656,16 @@ impl ForgePlugin for IdentityPlugin {
                 let force = sub.get_flag("force");
                 // #288 — only show secret key when explicitly requested
                 let show_secret = sub.get_flag("show-secret");
-                let identity = generate_identity(&path, name, force)?;
+                let identity = match sub.get_one::<String>("from-mnemonic") {
+                    Some(mnemonic) => generate_identity_from_mnemonic(
+                        &path,
+                        name,
+                        force,
+                        mnemonic,
+                        sub.get_one::<u32>("index").copied().unwrap_or(0),
+                    )?,
+                    None => generate_identity(&path, name, force)?,
+                };
                 let (public_key, secret_key) = (identity.public_key, identity.secret_key);
 
                 if ctx.json {
@@ -841,6 +940,24 @@ mod tests {
         let (pub1, _) = generate_keypair();
         let (pub2, _) = generate_keypair();
         assert_ne!(pub1, pub2, "two generated keypairs should differ");
+    }
+
+    #[test]
+    fn mnemonic_derivation_is_reproducible_and_indexed() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let first = derive_keypair_from_mnemonic(mnemonic, 0).unwrap();
+        let repeated = derive_keypair_from_mnemonic(mnemonic, 0).unwrap();
+        let next_index = derive_keypair_from_mnemonic(mnemonic, 1).unwrap();
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, next_index);
+        assert_eq!(public_key_from_secret(&first.1).unwrap(), first.0);
+    }
+
+    #[test]
+    fn mnemonic_derivation_rejects_invalid_phrase_and_index() {
+        assert!(derive_keypair_from_mnemonic("not a valid mnemonic", 0).is_err());
+        assert!(derive_keypair_from_mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 1 << 31).is_err());
     }
 
     #[test]
@@ -1309,6 +1426,33 @@ mod tests {
         assert!(sub_names.contains(&"fund"));
         assert!(sub_names.contains(&"remove"));
         assert!(sub_names.contains(&"use"));
+    }
+
+    #[test]
+    fn generate_command_accepts_mnemonic_and_index() {
+        let matches = IdentityPlugin
+            .command()
+            .try_get_matches_from([
+                "identity",
+                "generate",
+                "ci",
+                "--from-mnemonic",
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                "--index",
+                "3",
+            ])
+            .unwrap();
+        let (_, generate) = matches.subcommand().unwrap();
+        assert_eq!(
+            generate.get_one::<String>("from-mnemonic").map(String::as_str),
+            Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+        );
+        assert_eq!(generate.get_one::<u32>("index"), Some(&3));
+
+        assert!(IdentityPlugin
+            .command()
+            .try_get_matches_from(["identity", "generate", "random"])
+            .is_ok());
     }
 
     // #428 — funded marker is recorded in store and displayed in format_list
