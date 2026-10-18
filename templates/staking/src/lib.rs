@@ -12,11 +12,12 @@ pub enum Error {
     NotAdmin = 2,
     NoRewards = 3,
     InvalidAmount = 4,
+    NoStakers = 5,
     /// An intermediate multiplication or division would overflow i128.
     /// This can happen when `amount * SCALE` exceeds i128::MAX, which
     /// is possible for 18-decimal tokens once `amount` exceeds roughly
     /// 1.7 × 10²⁰ base units (~170 tokens at 18 decimals).
-    Overflow = 5,
+    Overflow = 6,
 }
 
 #[contracttype]
@@ -155,23 +156,24 @@ impl StakingContract {
     pub fn distribute(env: Env, amount: i128) {
         admin(&env).require_auth();
         let total = total_staked(&env);
-        if total > 0 {
-            // Validate arithmetic before moving tokens: amount * SCALE overflows
-            // i128 when amount > i128::MAX / SCALE (~1.7 × 10²⁰ base units, or
-            // ~170 whole tokens at 18 decimals). Surface this as Error::Overflow
-            // rather than a silent wrap-around trap.
-            let delta = amount
-                .checked_mul(SCALE)
-                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
-                / total;
-            let tok = token(&env);
-            soroban_sdk::token::Client::new(&env, &tok).transfer(
-                &admin(&env),
-                &env.current_contract_address(),
-                &amount,
-            );
-            set_acc_per_share(&env, acc_per_share(&env) + delta);
+        if total == 0 {
+            panic_with_error!(&env, Error::NoStakers);
         }
+        // Validate arithmetic before moving tokens: amount * SCALE overflows
+        // i128 when amount > i128::MAX / SCALE (~1.7 × 10²⁰ base units, or
+        // ~170 whole tokens at 18 decimals). Surface this as Error::Overflow
+        // rather than a silent wrap-around trap.
+        let delta = amount
+            .checked_mul(SCALE)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
+            / total;
+        let tok = token(&env);
+        soroban_sdk::token::Client::new(&env, &tok).transfer(
+            &admin(&env),
+            &env.current_contract_address(),
+            &amount,
+        );
+        set_acc_per_share(&env, acc_per_share(&env) + delta);
         env.events().publish((symbol_short!("distrib"),), amount);
     }
 
