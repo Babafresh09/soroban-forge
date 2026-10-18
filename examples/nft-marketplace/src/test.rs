@@ -218,8 +218,8 @@ fn test_buy_with_zero_fee() {
 #[test]
 fn test_buy_with_max_fee() {
     let env = Env::default();
-    // 10000 bps = 100% fee
-    let ctx = setup(&env, 10_000);
+    // MAX_FEE_BPS = 1000 bps = 10% fee
+    let ctx = setup(&env, MAX_FEE_BPS);
 
     ctx.nft.mint(
         &ctx.seller,
@@ -233,11 +233,10 @@ fn test_buy_with_max_fee() {
     ctx.marketplace.buy(&ctx.buyer, &ctx.nft_id, &7);
 
     assert_eq!(ctx.nft.owner_of(&7), ctx.buyer);
-    assert_eq!(ctx.payment.client.balance(&ctx.treasury), 1_000);
-    assert_eq!(ctx.payment.client.balance(&ctx.seller), 0);
+    assert_eq!(ctx.payment.client.balance(&ctx.treasury), 100);
+    assert_eq!(ctx.payment.client.balance(&ctx.seller), 900);
     assert_eq!(ctx.payment.client.balance(&ctx.buyer), 0);
 }
-
 #[test]
 fn test_cancel() {
     let env = Env::default();
@@ -357,4 +356,123 @@ fn test_set_fee_bps_too_high() {
     let ctx = setup(&env, 250);
 
     ctx.marketplace.set_fee_bps(&10_001);
+}
+
+#[test]
+fn test_listing_records_fee_at_creation() {
+    let env = Env::default();
+    let ctx = setup(&env, 500);
+
+    ctx.nft.mint(
+        &ctx.seller,
+        &1,
+        &String::from_str(&env, "https://example.com/1"),
+    );
+    ctx.marketplace
+        .list(&ctx.seller, &ctx.nft_id, &1, &ctx.payment.address, &1_000);
+
+    // A later fee change must not touch the stored listing.
+    ctx.marketplace.set_fee_bps(&MAX_FEE_BPS);
+
+    let listing = ctx.marketplace.get_listing(&ctx.nft_id, &1).unwrap();
+    assert_eq!(listing.fee_bps, 500);
+    assert_eq!(ctx.marketplace.fee_bps(), MAX_FEE_BPS);
+}
+
+#[test]
+fn test_fee_raised_after_listing_does_not_change_seller_payout() {
+    let env = Env::default();
+    // 500 bps = 5% when the seller lists.
+    let ctx = setup(&env, 500);
+
+    ctx.nft.mint(
+        &ctx.seller,
+        &1,
+        &String::from_str(&env, "https://example.com/1"),
+    );
+    ctx.marketplace
+        .list(&ctx.seller, &ctx.nft_id, &1, &ctx.payment.address, &1_000);
+
+    // Admin raises the fee to the cap before the purchase lands.
+    ctx.marketplace.set_fee_bps(&MAX_FEE_BPS);
+
+    ctx.payment.admin.mint(&ctx.buyer, &1_000);
+    ctx.marketplace.buy(&ctx.buyer, &ctx.nft_id, &1);
+
+    // Seller still gets 1000 - 5% = 950; the raised fee is not applied.
+    assert_eq!(ctx.payment.client.balance(&ctx.seller), 950);
+    assert_eq!(ctx.payment.client.balance(&ctx.treasury), 50);
+    assert_eq!(ctx.payment.client.balance(&ctx.buyer), 0);
+    assert_eq!(ctx.nft.owner_of(&1), ctx.buyer);
+}
+
+#[test]
+fn test_fee_lowered_after_listing_still_uses_listed_fee() {
+    let env = Env::default();
+    let ctx = setup(&env, 500);
+
+    ctx.nft.mint(
+        &ctx.seller,
+        &1,
+        &String::from_str(&env, "https://example.com/1"),
+    );
+    ctx.marketplace
+        .list(&ctx.seller, &ctx.nft_id, &1, &ctx.payment.address, &1_000);
+
+    ctx.marketplace.set_fee_bps(&0);
+
+    ctx.payment.admin.mint(&ctx.buyer, &1_000);
+    ctx.marketplace.buy(&ctx.buyer, &ctx.nft_id, &1);
+
+    // The fee agreed at listing time applies in both directions.
+    assert_eq!(ctx.payment.client.balance(&ctx.seller), 950);
+    assert_eq!(ctx.payment.client.balance(&ctx.treasury), 50);
+}
+
+#[test]
+fn test_new_listing_uses_the_new_fee() {
+    let env = Env::default();
+    let ctx = setup(&env, 500);
+
+    ctx.marketplace.set_fee_bps(&200);
+
+    ctx.nft.mint(
+        &ctx.seller,
+        &1,
+        &String::from_str(&env, "https://example.com/1"),
+    );
+    ctx.marketplace
+        .list(&ctx.seller, &ctx.nft_id, &1, &ctx.payment.address, &1_000);
+    assert_eq!(
+        ctx.marketplace
+            .get_listing(&ctx.nft_id, &1)
+            .unwrap()
+            .fee_bps,
+        200
+    );
+
+    ctx.payment.admin.mint(&ctx.buyer, &1_000);
+    ctx.marketplace.buy(&ctx.buyer, &ctx.nft_id, &1);
+    assert_eq!(ctx.payment.client.balance(&ctx.seller), 980);
+    assert_eq!(ctx.payment.client.balance(&ctx.treasury), 20);
+}
+
+#[test]
+fn test_set_fee_bps_accepts_cap_and_rejects_above_it() {
+    let env = Env::default();
+    let ctx = setup(&env, 250);
+
+    ctx.marketplace.set_fee_bps(&MAX_FEE_BPS);
+    assert_eq!(ctx.marketplace.fee_bps(), MAX_FEE_BPS);
+
+    assert!(ctx.marketplace.try_set_fee_bps(&(MAX_FEE_BPS + 1)).is_err());
+    // The rejected call changed nothing.
+    assert_eq!(ctx.marketplace.fee_bps(), MAX_FEE_BPS);
+}
+
+#[test]
+#[should_panic]
+fn test_constructor_rejects_fee_above_cap() {
+    let env = Env::default();
+    setup(&env, MAX_FEE_BPS + 1);
 }

@@ -85,18 +85,25 @@ fn put_reserves(env: &Env, reserve_a: i128, reserve_b: i128) {
 }
 
 fn get_shares(env: &Env, owner: &Address) -> i128 {
-    env.storage()
-        .instance()
-        .get(&DataKey::Shares(owner.clone()))
-        .unwrap_or(0)
+    let key = DataKey::Shares(owner.clone());
+    if let Some(shares) = env.storage().persistent().get::<_, i128>(&key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 17_280 * 29, 17_280 * 30);
+        shares
+    } else {
+        0
+    }
 }
 
 fn mint_shares(env: &Env, to: &Address, amount: i128) {
+    let key = DataKey::Shares(to.clone());
     let new_owner = get_shares(env, to) + amount;
     let new_total = get_total_shares(env) + amount;
+    env.storage().persistent().set(&key, &new_owner);
     env.storage()
-        .instance()
-        .set(&DataKey::Shares(to.clone()), &new_owner);
+        .persistent()
+        .extend_ttl(&key, 17_280 * 29, 17_280 * 30);
     env.storage()
         .instance()
         .set(&DataKey::TotalShares, &new_total);
@@ -107,9 +114,11 @@ fn burn_shares(env: &Env, from: &Address, amount: i128) {
     if owned < amount {
         panic_with_error!(env, Error::InsufficientLiquidity);
     }
+    let key = DataKey::Shares(from.clone());
+    env.storage().persistent().set(&key, &(owned - amount));
     env.storage()
-        .instance()
-        .set(&DataKey::Shares(from.clone()), &(owned - amount));
+        .persistent()
+        .extend_ttl(&key, 17_280 * 29, 17_280 * 30);
     env.storage()
         .instance()
         .set(&DataKey::TotalShares, &(get_total_shares(env) - amount));

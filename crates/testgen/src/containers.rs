@@ -323,6 +323,8 @@ mod tests {
                 .iter()
                 .map(|(n, t)| (n.to_string(), t.to_string()))
                 .collect(),
+            requires_auth: false,
+            has_i128_math: false,
         }
     }
 

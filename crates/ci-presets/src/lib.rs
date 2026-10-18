@@ -82,7 +82,7 @@ pub fn parse_providers(raw: &str) -> Result<Vec<String>> {
 pub fn output_dir(provider: &str) -> &'static str {
     match provider {
         "github" => ".github/workflows",
-        "gitlab" | "bitbucket" | "azure" | "woodpecker" => ".",
+        "jenkins" | "gitlab" | "bitbucket" | "azure" | "woodpecker" => ".",
         "circleci" => ".circleci",
         "buildkite" => ".buildkite",
         _ => unreachable!("validated against available_providers()"),
@@ -310,6 +310,7 @@ pub fn generate(
             list
         }
         "gitlab" => vec![(".gitlab-ci.yml", None)],
+        "jenkins" => vec![("Jenkinsfile", None)],
         "bitbucket" => vec![("bitbucket-pipelines.yml", None)],
         "azure" => vec![("azure-pipelines.yml", None)],
         "circleci" => vec![("config.yml", None)],
@@ -383,6 +384,7 @@ fn all_target_paths(dir: &Path, provider: &str) -> Vec<std::path::PathBuf> {
             ]
         }
         "gitlab" => vec![out_dir.join(".gitlab-ci.yml")],
+        "jenkins" => vec![out_dir.join("Jenkinsfile")],
         "bitbucket" => vec![out_dir.join("bitbucket-pipelines.yml")],
         "azure" => vec![out_dir.join("azure-pipelines.yml")],
         "circleci" => vec![out_dir.join("config.yml")],
@@ -550,11 +552,19 @@ fn print_diff(path: &Path, generated: &str) -> Result<()> {
     let mut cmd = std::process::Command::new("diff");
     cmd.arg("-u").arg("--label").arg("generated").arg("--label").arg(path.to_string_lossy().as_ref());
     cmd.arg(left).arg(&temp_path);
-    let output = cmd.output().map_err(ForgeError::io(format!("running diff for {}", path.display())))?;
+    let output = cmd.output().map_err(|error| diff_spawn_error(path, error))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     print!("\n--- {} ---\n{stdout}", path.display());
     std::fs::remove_file(&temp_path).ok();
     Ok(())
+}
+
+fn diff_spawn_error(path: &Path, error: std::io::Error) -> ForgeError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        ForgeError::ToolMissing("diff — install diffutils to use --diff".into())
+    } else {
+        ForgeError::io(format!("running diff for {}", path.display()))(error)
+    }
 }
 
 pub struct CiPresetsPlugin;
@@ -709,6 +719,34 @@ impl ForgePlugin for CiPresetsPlugin {
 mod tests {
     use super::*;
 
+    #[test]
+    fn missing_diff_binary_returns_tool_missing() {
+        let error = diff_spawn_error(
+            Path::new("workflow.yml"),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+
+        assert!(matches!(
+            error,
+            ForgeError::ToolMissing(message) if message == "diff — install diffutils to use --diff"
+        ));
+    }
+
+    #[test]
+    fn other_diff_spawn_errors_remain_io_errors() {
+        let error = diff_spawn_error(
+            Path::new("workflow.yml"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+
+        assert!(matches!(
+            error,
+            ForgeError::Io { context, source }
+                if context == "running diff for workflow.yml"
+                    && source.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
     fn base_opts() -> GenerateOptions {
         GenerateOptions::default()
     }
@@ -790,7 +828,8 @@ mod tests {
         let contents =
             std::fs::read_to_string(coverage_dir.path().join(".github/workflows/coverage.yml"))
                 .unwrap();
-        assert!(contents.contains("codecov/codecov-action@v4"));
+        assert!(contents
+            .contains("codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238  # v4"));
         assert!(contents.contains("cargo llvm-cov"));
     }
 
@@ -855,10 +894,11 @@ mod tests {
     }
 
     #[test]
-    fn available_providers_includes_github_gitlab_circleci_azure() {
+    fn available_providers_includes_supported_providers() {
         let providers = available_providers();
         assert!(providers.contains(&"github"));
         assert!(providers.contains(&"gitlab"));
+        assert!(providers.contains(&"jenkins"));
         assert!(providers.contains(&"circleci"));
         assert!(providers.contains(&"bitbucket"));
         assert!(providers.contains(&"azure"));
@@ -885,6 +925,48 @@ mod tests {
         assert!(contents.contains("cargo test"));
         assert!(contents.contains("cargo build --target wasm32v1-none --release"));
         assert!(!contents.contains("{{project_name}}"));
+    }
+
+    #[test]
+    fn writes_jenkins_pipeline_at_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(output_dir("jenkins"), ".");
+        let written = generate(
+            dir.path(),
+            "jenkins",
+            "my-contract",
+            false,
+            false,
+            &GenerateOptions {
+                max_size: Some(32_768),
+                ..base_opts()
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(written, vec!["Jenkinsfile"]);
+
+        let contents = std::fs::read_to_string(dir.path().join("Jenkinsfile")).unwrap();
+        assert!(contents.starts_with("// Generated by `soroban-forge ci-init"));
+        assert!(contents.contains("pipeline {"));
+        assert!(contents.contains("stage('Toolchain Setup')"));
+        assert!(contents.contains("stage('Build')"));
+        assert!(contents.contains("stage('Test')"));
+        assert!(contents.contains("stage('Size Check')"));
+        assert!(contents.contains(
+            "rustup toolchain install stable --profile minimal --target wasm32v1-none"
+        ));
+        assert!(contents.contains("cargo build --target wasm32v1-none --release"));
+        assert!(contents.contains("cargo test"));
+        assert!(contents.contains("MAX_WASM_BYTES = '32768'"));
+        assert!(contents.contains("target/wasm32v1-none/release/*.wasm"));
+        assert!(!contents.contains("{{"));
+
+        let stage_order = ["Toolchain Setup", "Build", "Test", "Size Check"].map(|stage| {
+            let marker = format!("stage('{stage}')");
+            contents.find(marker.as_str()).unwrap()
+        });
+        assert!(stage_order.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
@@ -1056,7 +1138,9 @@ mod tests {
         assert!(written.iter().any(|path| path == ".github/workflows/release.yml"));
         let contents = std::fs::read_to_string(dir.path().join(".github/workflows/release.yml")).unwrap();
         assert!(contents.contains("cargo build --target wasm32v1-none --release --locked"));
-        assert!(contents.contains("softprops/action-gh-release@v2"));
+        assert!(contents.contains(
+            "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2"
+        ));
         assert!(contents.contains("v*.*.*"));
     }
 
@@ -1083,8 +1167,8 @@ mod tests {
     #[test]
     fn parse_providers_two_providers() {
         assert_eq!(
-            parse_providers("github,gitlab").unwrap(),
-            vec!["github", "gitlab"]
+            parse_providers("github,gitlab,jenkins").unwrap(),
+            vec!["github", "gitlab", "jenkins"]
         );
     }
 
@@ -1106,8 +1190,8 @@ mod tests {
 
     #[test]
     fn parse_providers_rejects_unknown() {
-        let err = parse_providers("github,jenkins").unwrap_err().to_string();
-        assert!(err.contains("jenkins"), "error should name the bad provider: {err}");
+        let err = parse_providers("github,not-a-provider").unwrap_err().to_string();
+        assert!(err.contains("not-a-provider"), "error should name the bad provider: {err}");
     }
 
     #[test]
@@ -1323,5 +1407,85 @@ mod tests {
         assert_eq!(removed, vec![".gitlab-ci.yml".to_string()]);
         assert!(!dir.path().join(".gitlab-ci.yml").exists());
     }
-}
 
+    #[test]
+    fn remove_deletes_jenkins_preset_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = generate(dir.path(), "jenkins", "demo", false, false, &base_opts(), false)
+            .unwrap();
+        assert_eq!(written, vec!["Jenkinsfile"]);
+        assert!(dir.path().join("Jenkinsfile").exists());
+
+        let removed = remove(dir.path(), "jenkins", false).unwrap();
+        assert_eq!(removed, vec!["Jenkinsfile"]);
+        assert!(!dir.path().join("Jenkinsfile").exists());
+    }
+
+    /// A floating `uses:` is what #609 removed; catch the next one before a
+    /// preset ships it. Every action reference in `presets/` must name a
+    /// 40-character commit SHA, and keep the `# <version>` comment that tells a
+    /// reader which release the SHA belongs to.
+    #[test]
+    fn every_preset_action_is_pinned_to_a_commit_sha() {
+        fn is_sha(ref_: &str) -> bool {
+            ref_.len() == 40
+                && ref_
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+
+        fn walk(dir: &Dir<'_>, bad: &mut Vec<String>) {
+            for file in dir.files() {
+                let Some(text) = file.contents_utf8() else {
+                    continue;
+                };
+                for (n, line) in text.lines().enumerate() {
+                    let Some((_, after)) = line.split_once("uses:") else {
+                        continue;
+                    };
+                    let after = after.trim();
+                    let (action, rest) = match after.split_once(char::is_whitespace) {
+                        Some((action, rest)) => (action, rest),
+                        None => (after, ""),
+                    };
+                    if action.starts_with("./") || action.is_empty() {
+                        continue;
+                    }
+                    let Some((_, r)) = action.rsplit_once('@') else {
+                        bad.push(format!(
+                            "{}:{}: `{action}` names no ref at all",
+                            file.path().display(),
+                            n + 1
+                        ));
+                        continue;
+                    };
+                    if !is_sha(r) {
+                        bad.push(format!(
+                            "{}:{}: `{action}` should be pinned to a 40-character SHA, found `{r}`",
+                            file.path().display(),
+                            n + 1
+                        ));
+                    }
+                    if !rest.contains('#') {
+                        bad.push(format!(
+                            "{}:{}: `{action}` has no `# <version>` comment",
+                            file.path().display(),
+                            n + 1
+                        ));
+                    }
+                }
+            }
+            for sub in dir.dirs() {
+                walk(sub, bad);
+            }
+        }
+
+        let mut bad = Vec::new();
+        walk(&PRESETS, &mut bad);
+        assert!(
+            bad.is_empty(),
+            "every `uses:` in presets/ must be pinned to a commit SHA with a version comment:\n{}",
+            bad.join("\n")
+        );
+    }
+}

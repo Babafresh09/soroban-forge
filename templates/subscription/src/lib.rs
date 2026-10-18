@@ -116,15 +116,17 @@ impl SubscriptionContract {
         if !sub.active {
             panic!("subscription is not active");
         }
-        if env.ledger().timestamp() < sub.next_charge {
+        let now = env.ledger().timestamp();
+        if now < sub.next_charge {
             panic!("interval has not elapsed");
         }
 
         let amount = Self::pull_payment(&env, &subscriber);
 
-        // Advance by exactly one interval so a late charge does not skip a
-        // period, and two charges in a row are impossible.
-        sub.next_charge += Self::interval(env.clone());
+        // Advance past the current ledger timestamp so an overdue subscription
+        // cannot be charged several times in a row in the same ledger.
+        let interval = Self::interval(env.clone());
+        sub.next_charge = now + interval;
         sub.charges += 1;
         env.storage()
             .instance()
