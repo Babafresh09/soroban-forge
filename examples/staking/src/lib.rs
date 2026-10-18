@@ -11,6 +11,8 @@ pub enum Error {
     InsufficientStake = 1,
     NotAdmin = 2,
     NoRewards = 3,
+    InvalidAmount = 4,
+    NoStakers = 5,
 }
 
 #[contracttype]
@@ -102,6 +104,9 @@ impl StakingContract {
 
     pub fn deposit(env: Env, user: Address, amount: i128) {
         user.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
         _claim(&env, &user);
         let new = read_staked(&env, &user) + amount;
         write_staked(&env, &user, new);
@@ -112,6 +117,9 @@ impl StakingContract {
 
     pub fn withdraw(env: Env, user: Address, amount: i128) {
         user.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
         let cur = read_staked(&env, &user);
         if cur < amount {
             panic_with_error!(&env, Error::InsufficientStake);
@@ -127,15 +135,16 @@ impl StakingContract {
     pub fn distribute(env: Env, amount: i128) {
         admin(&env).require_auth();
         let total = total_staked(&env);
-        if total > 0 {
-            let tok = token(&env);
-            soroban_sdk::token::Client::new(&env, &tok).transfer(
-                &admin(&env),
-                &env.current_contract_address(),
-                &amount,
-            );
-            set_acc_per_share(&env, acc_per_share(&env) + amount * SCALE / total);
+        if total == 0 {
+            panic_with_error!(&env, Error::NoStakers);
         }
+        let tok = token(&env);
+        soroban_sdk::token::Client::new(&env, &tok).transfer(
+            &admin(&env),
+            &env.current_contract_address(),
+            &amount,
+        );
+        set_acc_per_share(&env, acc_per_share(&env) + amount * SCALE / total);
         env.events().publish((symbol_short!("distrib"),), amount);
     }
 
