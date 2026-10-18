@@ -157,70 +157,30 @@ pub fn write_identity_to_forge_toml(cwd: &std::path::Path, name: &str) -> Result
 
 /// Patch (or append) the `[identity]` section in raw `forge.toml` text.
 ///
-/// Rules:
-/// - If an `[identity]` section already exists, the `default = …` key within it is
-///   replaced (or inserted if missing). Other keys in the section are preserved.
-/// - If no `[identity]` section exists, one is appended.
+/// Uses `toml_edit` to edit the document structurally while preserving
+/// comments and formatting.
 pub fn patch_forge_toml_identity(existing: &str, name: &str) -> String {
-    let original_lines: Vec<&str> = existing.lines().collect();
-    let mut out_lines: Vec<String> = Vec::with_capacity(original_lines.len() + 3);
+    use toml_edit::{value, DocumentMut, Item, Table};
 
-    let mut in_identity_section = false;
-    let mut default_key_written = false;
-    let mut identity_section_header_idx: Option<usize> = None;
+    let mut doc = existing
+        .parse::<DocumentMut>()
+        .unwrap_or_else(|_| DocumentMut::new());
 
-    for line in &original_lines {
-        let trimmed = line.trim();
-
-        if trimmed == "[identity]" {
-            in_identity_section = true;
-            identity_section_header_idx = Some(out_lines.len());
-            out_lines.push(line.to_string());
-            continue;
+    match doc.get_mut("identity") {
+        Some(Item::Table(table)) => {
+            table["default"] = value(name);
         }
-
-        // Entering a new section other than [identity]
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if in_identity_section && !default_key_written {
-                out_lines.push(format!("default = \"{name}\""));
-                default_key_written = true;
-            }
-            in_identity_section = false;
-            out_lines.push(line.to_string());
-            continue;
+        Some(Item::Value(toml_edit::Value::InlineTable(inline))) => {
+            inline.insert("default", name.into());
         }
-
-        // Replace the `default = ...` key inside [identity]
-        if in_identity_section && !default_key_written {
-            if let Some(eq_pos) = trimmed.find('=') {
-                let key = trimmed[..eq_pos].trim();
-                if key == "default" {
-                    out_lines.push(format!("default = \"{name}\""));
-                    default_key_written = true;
-                    continue; // skip old line
-                }
-            }
+        _ => {
+            let mut table = Table::new();
+            table["default"] = value(name);
+            doc["identity"] = Item::Table(table);
         }
-
-        out_lines.push(line.to_string());
     }
 
-    // EOF while still inside [identity] and default was never written
-    if in_identity_section && !default_key_written {
-        out_lines.push(format!("default = \"{name}\""));
-        default_key_written = true;
-    }
-
-    // No [identity] section found at all — append
-    if identity_section_header_idx.is_none() && !default_key_written {
-        if !out_lines.is_empty() && !out_lines.last().map(|l| l.is_empty()).unwrap_or(true) {
-            out_lines.push(String::new());
-        }
-        out_lines.push("[identity]".to_string());
-        out_lines.push(format!("default = \"{name}\""));
-    }
-
-    let mut result = out_lines.join("\n");
+    let mut result = doc.to_string();
     if !result.ends_with('\n') {
         result.push('\n');
     }

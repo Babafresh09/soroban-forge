@@ -18,6 +18,7 @@ stellar-strkey = "0.0.13"
 rand = "0.8"
 dirs = "6"
 ureq = "2"
+toml_edit = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true
