@@ -38,10 +38,10 @@ tests/snapshots/
 *.swp
 *.swo
 *~
+temp_auto_push.bat
 
 # Editor and IDE directories
 .idea/
-.vscode/
 *.iml
 
 # Logs
@@ -49,9 +49,6 @@ tests/snapshots/
 forge-debug.log
 
 # Environment files / secrets
-.env
-.env.*
-.env.local
 .env.*.local
 *.pem
 *.key
@@ -80,3 +77,6 @@ criterion/
 
 # Local config overrides
 forge.local.toml
+.gitignore
+branch_structure.json
+config.bat
