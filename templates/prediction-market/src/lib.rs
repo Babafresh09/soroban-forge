@@ -7,6 +7,10 @@
 //! * **One pool** — YES and NO stakes are escrowed together by the contract.
 //!   A winner is entitled to `stake * total_pool / winning_pool`, so the
 //!   losing side's stakes are what pays the winning side's profit.
+//! * **Betting close** — the market has a close time (a ledger timestamp)
+//!   fixed at deploy time. `stake` only works before it and `resolve` only
+//!   works from it on, so nobody can still buy in once the outcome can be
+//!   reported. The close instant itself counts as closed.
 //! * **Oracle** — `resolve` is gated on one address fixed at deploy time.
 //!   Nobody else can report an outcome, and it can only be reported once.
 //! * **Pull payments** — nothing is pushed on resolution. Each winner claims
@@ -17,9 +21,9 @@
 //! Two edges this template deliberately leaves open, both worth closing
 //! before using it for real:
 //!
-//! * There is no staking deadline — the market accepts stakes right up until
-//!   the oracle resolves it, so someone who learns the outcome early can
-//!   still buy in. A real market closes staking before the event settles.
+//! * There is no deadline for the oracle — if it never calls `resolve` (a lost
+//!   key, an abandoned market), the stakes stay in the contract and there is no
+//!   refund path.
 //! * If the oracle resolves to a side nobody staked, there are no winners and
 //!   the pool stays in the contract; every `claim` reports `NothingToClaim`.
 //!
@@ -48,6 +52,12 @@ pub enum Error {
     AlreadyClaimed = 5,
     /// Nothing is owed to this address.
     NothingToClaim = 6,
+    /// The close time given to the constructor is not in the future.
+    CloseTimeInPast = 7,
+    /// The betting close time has been reached: staking is closed.
+    BettingClosed = 8,
+    /// The betting close time has not been reached yet: resolving is not open.
+    BettingStillOpen = 9,
 }
 
 #[contracttype]
@@ -57,6 +67,8 @@ pub enum DataKey {
     Oracle,
     /// SEP-41 token stakes are denominated in.
     Token,
+    /// Ledger timestamp from which staking is closed and resolving is open.
+    CloseTime,
     /// The winning outcome. Its *presence* is what marks the market resolved.
     Outcome,
     /// Total staked on one outcome.
@@ -73,6 +85,17 @@ fn oracle(env: &Env) -> Address {
 
 fn token_address(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Token).unwrap()
+}
+
+fn close_time(env: &Env) -> u64 {
+    env.storage().instance().get(&DataKey::CloseTime).unwrap()
+}
+
+/// Whether betting has closed. The close instant itself counts as closed, so
+/// "before the close" (staking) and "from the close on" (resolving) are exact
+/// complements.
+fn betting_closed(env: &Env) -> bool {
+    env.ledger().timestamp() >= close_time(env)
 }
 
 /// The winning outcome, or `None` while the market is still open.
@@ -114,16 +137,24 @@ impl PredictionMarketContract {
     ///
     /// * `oracle` — the only address that will be able to `resolve`
     /// * `token` — address of the token stakes are made in
-    pub fn __constructor(env: Env, oracle: Address, token: Address) {
+    /// * `close_time` — unix timestamp (seconds) from which staking is closed
+    ///   and the oracle may resolve. Must be in the future.
+    pub fn __constructor(env: Env, oracle: Address, token: Address, close_time: u64) {
+        if close_time <= env.ledger().timestamp() {
+            panic_with_error!(&env, Error::CloseTimeInPast);
+        }
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         env.storage().instance().set(&DataKey::Token, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::CloseTime, &close_time);
     }
 
     /// Stake `amount` on an outcome — `true` for YES, `false` for NO.
     ///
     /// The tokens are transferred into the contract's escrow. Staking is only
-    /// possible while the market is unresolved; an address may stake more
-    /// than once, and may stake on both sides.
+    /// possible before the close time; an address may stake more than once,
+    /// and may stake on both sides.
     pub fn stake(env: Env, from: Address, outcome: bool, amount: i128) {
         from.require_auth();
         if amount <= 0 {
@@ -131,6 +162,9 @@ impl PredictionMarketContract {
         }
         if resolved_outcome(&env).is_some() {
             panic_with_error!(&env, Error::AlreadyResolved);
+        }
+        if betting_closed(&env) {
+            panic_with_error!(&env, Error::BettingClosed);
         }
 
         token::Client::new(&env, &token_address(&env)).transfer(
@@ -151,8 +185,9 @@ impl PredictionMarketContract {
             .publish((symbol_short!("stake"), from, outcome), amount);
     }
 
-    /// Report the winning outcome. Only the oracle may call this, and only
-    /// once.
+    /// Report the winning outcome. Only the oracle may call this, only once,
+    /// and only once betting has closed — so nobody can still stake when the
+    /// outcome becomes reportable.
     ///
     /// `caller` is passed explicitly rather than authorizing the stored
     /// oracle directly, so the address that signed is checked against the
@@ -164,6 +199,9 @@ impl PredictionMarketContract {
         }
         if resolved_outcome(&env).is_some() {
             panic_with_error!(&env, Error::AlreadyResolved);
+        }
+        if !betting_closed(&env) {
+            panic_with_error!(&env, Error::BettingStillOpen);
         }
         env.storage().instance().set(&DataKey::Outcome, &outcome);
 
@@ -217,6 +255,11 @@ impl PredictionMarketContract {
 
     pub fn get_token(env: Env) -> Address {
         token_address(&env)
+    }
+
+    /// The ledger timestamp from which staking is closed and resolving is open.
+    pub fn get_close_time(env: Env) -> u64 {
+        close_time(&env)
     }
 
     /// The winning outcome, or `None` while the market is unresolved.
