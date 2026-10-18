@@ -49,7 +49,7 @@ scaffolding.
   - `--localnet` — also generate the ignored `tests/forge_localnet.rs` target;
     run it against a local Soroban network with
     `cargo test --test forge_localnet -- --ignored`.
-- `soroban-forge ci-init --provider <github|gitlab|circleci|bitbucket>` —
+- `soroban-forge ci-init --provider <github|gitlab|jenkins|circleci|bitbucket>` —
   generate CI workflows. `--matrix` adds a build/test workflow that runs across
   a Rust toolchain matrix (stable plus `--msrv`, default 1.84).
 - `soroban-forge test-init` — generate a test harness.
