@@ -368,3 +368,97 @@ fn claim_before_resolution_is_rejected() {
     close_betting(&env);
     assert_eq!(s.market.try_claim(&alice), Err(Ok(err(Error::NotResolved))));
 }
+
+// --- refund when nobody backed the winning outcome ---
+
+#[test]
+fn everyone_is_refunded_when_nobody_backed_the_winner() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = staker(&env, &s, NO, 600);
+    let bob = staker(&env, &s, NO, 400);
+    assert_eq!(s.market.get_pool(&YES), 0);
+
+    close_betting(&env);
+    s.market.resolve(&s.oracle, &YES);
+
+    assert_eq!(s.market.claim(&alice), 600);
+    assert_eq!(s.market.claim(&bob), 400);
+
+    // Everyone has exactly their stake back and the market is empty.
+    assert_eq!(s.token.balance(&alice), 600);
+    assert_eq!(s.token.balance(&bob), 400);
+    assert_eq!(s.token.balance(&s.market.address), 0);
+    assert!(s.market.has_claimed(&alice));
+    assert!(s.market.has_claimed(&bob));
+}
+
+#[test]
+fn refund_works_when_the_empty_side_is_no() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = staker(&env, &s, YES, 250);
+
+    let bob = staker(&env, &s, YES, 750);
+
+    close_betting(&env);
+    s.market.resolve(&s.oracle, &NO);
+
+    assert_eq!(s.market.claim(&alice), 250);
+    assert_eq!(s.market.claim(&bob), 750);
+    assert_eq!(s.token.balance(&s.market.address), 0);
+}
+
+#[test]
+fn refund_covers_repeated_stakes() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = Address::generate(&env);
+    s.token_admin.mint(&alice, &500);
+    s.market.stake(&alice, &NO, &200);
+    s.market.stake(&alice, &NO, &300);
+
+    close_betting(&env);
+    s.market.resolve(&s.oracle, &YES);
+
+    assert_eq!(s.market.claim(&alice), 500);
+    assert_eq!(s.token.balance(&alice), 500);
+}
+
+#[test]
+fn refund_cannot_be_claimed_twice() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = staker(&env, &s, NO, 600);
+    staker(&env, &s, NO, 400);
+    close_betting(&env);
+    s.market.resolve(&s.oracle, &YES);
+
+    s.market.claim(&alice);
+    assert_eq!(
+        s.market.try_claim(&alice),
+        Err(Ok(err(Error::AlreadyClaimed)))
+    );
+    assert_eq!(s.token.balance(&s.market.address), 400);
+}
+
+#[test]
+fn non_participant_gets_nothing_from_a_refund_market() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    staker(&env, &s, NO, 600);
+    close_betting(&env);
+    s.market.resolve(&s.oracle, &YES);
+
+    let outsider = Address::generate(&env);
+    assert_eq!(
+        s.market.try_claim(&outsider),
+        Err(Ok(err(Error::NothingToClaim)))
+    );
+    assert_eq!(s.token.balance(&s.market.address), 600);
+}
