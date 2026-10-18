@@ -189,74 +189,30 @@ pub fn write_network_to_forge_toml(cwd: &std::path::Path, name: &str) -> Result<
 
 /// Patch (or append) the `[network]` section in raw `forge.toml` text.
 ///
-/// Rules:
-/// - If a `[network]` section already exists, the `name = …` key within it is
-///   replaced (or inserted if missing). Other keys in the section are preserved.
-/// - If no `[network]` section exists, one is appended.
+/// Uses `toml_edit` to edit the document structurally while preserving
+/// comments and formatting.
 pub fn patch_forge_toml_network(existing: &str, name: &str) -> String {
-    // We do a simple line-by-line pass instead of a full TOML parse/re-emit
-    // so we preserve all comments and formatting.
-    let original_lines: Vec<&str> = existing.lines().collect();
-    let mut out_lines: Vec<String> = Vec::with_capacity(original_lines.len() + 3);
+    use toml_edit::{value, DocumentMut, Item, Table};
 
-    let mut in_network_section = false;
-    let mut name_key_written = false;
-    let mut network_section_header_idx: Option<usize> = None;
+    let mut doc = existing
+        .parse::<DocumentMut>()
+        .unwrap_or_else(|_| DocumentMut::new());
 
-    for line in &original_lines {
-        let trimmed = line.trim();
-
-        if trimmed == "[network]" {
-            in_network_section = true;
-            network_section_header_idx = Some(out_lines.len());
-            out_lines.push(line.to_string());
-            continue;
+    match doc.get_mut("network") {
+        Some(Item::Table(table)) => {
+            table["name"] = value(name);
         }
-
-        // Entering a new section other than [network]
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            // If we were in [network] and never wrote the name key, insert it now
-            // (before this new section header)
-            if in_network_section && !name_key_written {
-                out_lines.push(format!("name = \"{name}\""));
-                name_key_written = true;
-            }
-            in_network_section = false;
-            out_lines.push(line.to_string());
-            continue;
+        Some(Item::Value(toml_edit::Value::InlineTable(inline))) => {
+            inline.insert("name", name.into());
         }
-
-        // Replace the `name = ...` key inside [network]
-        if in_network_section && !name_key_written {
-            if let Some(eq_pos) = trimmed.find('=') {
-                let key = trimmed[..eq_pos].trim();
-                if key == "name" {
-                    out_lines.push(format!("name = \"{name}\""));
-                    name_key_written = true;
-                    continue; // skip the old line
-                }
-            }
+        _ => {
+            let mut table = Table::new();
+            table["name"] = value(name);
+            doc["network"] = Item::Table(table);
         }
-
-        out_lines.push(line.to_string());
     }
 
-    // EOF while still inside [network] and name was never written
-    if in_network_section && !name_key_written {
-        out_lines.push(format!("name = \"{name}\""));
-        name_key_written = true;
-    }
-
-    // No [network] section found at all — append
-    if network_section_header_idx.is_none() && !name_key_written {
-        if !out_lines.is_empty() && !out_lines.last().map(|l| l.is_empty()).unwrap_or(true) {
-            out_lines.push(String::new());
-        }
-        out_lines.push("[network]".to_string());
-        out_lines.push(format!("name = \"{name}\""));
-    }
-
-    let mut result = out_lines.join("\n");
+    let mut result = doc.to_string();
     if !result.ends_with('\n') {
         result.push('\n');
     }
@@ -827,26 +783,21 @@ impl ForgePlugin for NetworkPlugin {
 
             Some(("use", sub)) => {
                 let name = sub.get_one::<String>("name").unwrap();
-                update_store(&path, |store| {
+                let rpc_url = update_store(&path, |store| {
                     // #289 — also accept built-in names that aren't in the user store
-                    let network_exists = store.networks.contains_key(name.as_str())
-                        || well_known(name.as_str()).is_some();
-                    if !network_exists {
-                        return Err(ForgeError::InvalidArgument(format!(
+                    let network = resolve_network(store, name.as_str()).ok_or_else(|| {
+                        ForgeError::InvalidArgument(format!(
                             "network `{name}` not found (use `soroban-forge network list` to see available networks)"
-                        )));
-                    }
+                        ))
+                    })?;
 
                     store.default = Some(name.clone());
-                    Ok(())
+                    Ok(Some(network.rpc_url))
                 })?;
 
                 // #290 — persist the choice into forge.toml so deploy/invoke/verify pick it up
                 write_network_to_forge_toml(&ctx.cwd, name)?;
 
-                // The selected network always resolves here: `network_exists`
-                // above checked the store and the built-in presets.
-                let rpc_url = resolve_network(&store, name).map(|n| n.rpc_url);
                 let no_check = sub.get_flag("no-check");
 
                 if ctx.json {

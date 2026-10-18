@@ -129,24 +129,26 @@ fn charging_twice_in_the_same_period_fails() {
 }
 
 #[test]
-fn a_late_charge_does_not_skip_a_period() {
+fn an_overdue_subscription_cannot_be_charged_twice_in_the_same_ledger() {
     let env = Env::default();
     let f = setup(&env);
     f.contract.subscribe(&f.subscriber);
 
     // The merchant is late: two and a half intervals have passed.
-    env.ledger()
-        .with_mut(|li| li.timestamp = START_TS + INTERVAL * 2 + INTERVAL / 2);
+    let late_ts = START_TS + INTERVAL * 2 + INTERVAL / 2;
+    env.ledger().with_mut(|li| li.timestamp = late_ts);
 
-    // Each charge advances by exactly one interval, so both owed periods can
-    // still be collected — one call each.
-    assert_eq!(f.contract.charge(&f.subscriber), AMOUNT);
-    assert!(f.contract.is_due(&f.subscriber));
+    // First charge succeeds and schedules the next charge a full interval from now.
     assert_eq!(f.contract.charge(&f.subscriber), AMOUNT);
     assert!(!f.contract.is_due(&f.subscriber));
+    assert!(f.contract.try_charge(&f.subscriber).is_err());
 
-    assert_eq!(f.token.client.balance(&f.merchant), AMOUNT * 3);
-    assert_eq!(f.contract.subscription(&f.subscriber).charges, 3);
+    assert_eq!(f.token.client.balance(&f.merchant), AMOUNT * 2);
+    assert_eq!(f.contract.subscription(&f.subscriber).charges, 2);
+    assert_eq!(
+        f.contract.subscription(&f.subscriber).next_charge,
+        late_ts + INTERVAL
+    );
 }
 
 #[test]

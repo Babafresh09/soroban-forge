@@ -235,3 +235,15 @@ fn an_attacker_cannot_reinitialize_to_take_over_and_sweep() {
     assert_eq!(f.token.client.balance(&f.admin), TOTAL);
     assert_eq!(f.token.client.balance(&attacker), 0);
 }
+
+#[test]
+#[should_panic(expected = "claim window is still open")]
+fn sweep_before_deadline_is_rejected() {
+    use soroban_sdk::testutils::Ledger as _;
+    let env = Env::default();
+    let f = setup(&env);
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    f.contract.set_deadline(&2_000);
+    f.contract.sweep();
+}
+
