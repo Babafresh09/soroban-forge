@@ -15,9 +15,13 @@ serde_json.workspace = true
 log.workspace = true
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 stellar-strkey = "0.0.13"
+bip39 = "2.2"
+hmac = "0.12"
+sha2.workspace = true
 rand = "0.8"
 dirs = "6"
 ureq = "2"
+toml_edit = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true

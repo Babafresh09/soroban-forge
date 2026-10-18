@@ -34,6 +34,9 @@ pub enum DataKey {
     Admin,
     Token,
     Root,
+    /// Optional claim deadline timestamp; when set, claims close and `sweep`
+    /// unlocks only after `env.ledger().timestamp() >= deadline`.
+    Deadline,
     /// Amount an address has already claimed.
     Claimed(Address),
 }
@@ -61,6 +64,13 @@ impl MerkleAirdropContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Root, &root);
+    }
+
+    /// Set or update the claim deadline timestamp (admin only).
+    /// While `env.ledger().timestamp() < deadline`, `sweep` is rejected.
+    pub fn set_deadline(env: Env, deadline: u64) {
+        Self::admin(env.clone()).require_auth();
+        env.storage().instance().set(&DataKey::Deadline, &deadline);
     }
 
     /// Deposit `amount` tokens from the admin so claims can be paid out.
@@ -133,6 +143,11 @@ impl MerkleAirdropContract {
     /// claimed or the proof does not reproduce the root.
     pub fn claim(env: Env, claimant: Address, amount: i128, proof: Vec<BytesN<32>>) -> i128 {
         claimant.require_auth();
+        if let Some(deadline) = env.storage().instance().get::<_, u64>(&DataKey::Deadline) {
+            if env.ledger().timestamp() >= deadline {
+                panic!("claim window has closed");
+            }
+        }
         if amount <= 0 {
             panic!("amount must be positive");
         }
@@ -160,11 +175,17 @@ impl MerkleAirdropContract {
         amount
     }
 
-    /// Return everything still held by the contract to the admin, e.g. once
-    /// the claim window has closed.
+    /// Return everything still held by the contract to the admin once the
+    /// claim window has closed.
     pub fn sweep(env: Env) -> i128 {
         let admin = Self::admin(env.clone());
         admin.require_auth();
+
+        if let Some(deadline) = env.storage().instance().get::<_, u64>(&DataKey::Deadline) {
+            if env.ledger().timestamp() < deadline {
+                panic!("claim window is still open");
+            }
+        }
 
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token);

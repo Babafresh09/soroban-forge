@@ -111,13 +111,16 @@ impl FaucetContract {
             .unwrap();
 
         let key = DataKey::LastClaim(to.clone());
-        if let Some(last_claim) = env.storage().instance().get::<_, u64>(&key) {
+        if let Some(last_claim) = env.storage().persistent().get::<_, u64>(&key) {
             if now < last_claim + cooldown {
                 panic!("cooldown not elapsed");
             }
         }
 
-        env.storage().instance().set(&key, &now);
+        env.storage().persistent().set(&key, &now);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 17_280 * 29, 17_280 * 30);
 
         let amount: i128 = env
             .storage()
@@ -141,7 +144,7 @@ impl FaucetContract {
             .unwrap();
         match env
             .storage()
-            .instance()
+            .persistent()
             .get::<_, u64>(&DataKey::LastClaim(addr))
         {
             Some(last_claim) => last_claim + cooldown,

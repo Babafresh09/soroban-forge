@@ -70,6 +70,10 @@ pub struct MethodInfo {
     pub name: String,
     /// `(name, type)` pairs for each parameter (excluding the `env` receiver).
     pub args: Vec<(String, String)>,
+    /// Whether the method body calls `require_auth()`.
+    pub requires_auth: bool,
+    /// Whether an `i128` argument participates in arithmetic in the method body.
+    pub has_i128_math: bool,
 }
 
 /// A contract event detected from `env.events().publish(...)` calls or
@@ -542,7 +546,14 @@ pub fn find_methods(source: &str) -> (Vec<MethodInfo>, Option<Vec<(String, Strin
                 if name == "__constructor" {
                     constructor_args = Some(args);
                 } else {
-                    methods.push(MethodInfo { name, args });
+                    let requires_auth = method_body_requires_auth(&tokens, j + 1);
+                    let has_i128_math = method_body_has_i128_math(&tokens, j + 1, &args);
+                    methods.push(MethodInfo {
+                        name,
+                        args,
+                        requires_auth,
+                        has_i128_math,
+                    });
                 }
 
                 i = j;
@@ -553,6 +564,99 @@ pub fn find_methods(source: &str) -> (Vec<MethodInfo>, Option<Vec<(String, Strin
     }
 
     (methods, constructor_args)
+}
+
+fn method_body_requires_auth(tokens: &[String], after_args: usize) -> bool {
+    let Some(body_start) = (after_args..tokens.len())
+        .find(|&index| matches!(tokens[index].as_str(), "{" | ";" | "fn"))
+    else {
+        return false;
+    };
+    if tokens[body_start] != "{" {
+        return false;
+    }
+
+    let mut brace_depth = 0;
+    for (index, token) in tokens.iter().enumerate().skip(body_start) {
+        if token == "{" {
+            brace_depth += 1;
+        } else if token == "}" {
+            brace_depth -= 1;
+            if brace_depth == 0 {
+                return false;
+            }
+        } else if brace_depth > 0
+            && token == "require_auth"
+            && tokens.get(index + 1).is_some_and(|next| next == "(")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn method_body_has_i128_math(
+    tokens: &[String],
+    after_args: usize,
+    args: &[(String, String)],
+) -> bool {
+    if !args.iter().any(|(_, ty)| ty == "i128") {
+        return false;
+    }
+
+    let Some(body_start) = (after_args..tokens.len())
+        .find(|&index| matches!(tokens[index].as_str(), "{" | ";" | "fn"))
+    else {
+        return false;
+    };
+    if tokens[body_start] != "{" {
+        return false;
+    }
+
+    let mut brace_depth = 0;
+    let mut uses_i128_arg = false;
+    let mut has_arithmetic = false;
+    for token in tokens.iter().skip(body_start) {
+        if token == "{" {
+            brace_depth += 1;
+        } else if token == "}" {
+            brace_depth -= 1;
+            if brace_depth == 0 {
+                return uses_i128_arg && has_arithmetic;
+            }
+        } else if brace_depth > 0 {
+            uses_i128_arg |= args.iter().any(|(name, _)| name == token);
+            has_arithmetic |= matches!(token.as_str(), "+" | "-" | "*" | "/" | "%")
+                || matches!(
+                    token.as_str(),
+                    "checked_add"
+                        | "checked_sub"
+                        | "checked_mul"
+                        | "checked_div"
+                        | "checked_rem"
+                        | "checked_pow"
+                        | "checked_neg"
+                        | "checked_abs"
+                        | "saturating_add"
+                        | "saturating_sub"
+                        | "saturating_mul"
+                        | "saturating_pow"
+                        | "wrapping_add"
+                        | "wrapping_sub"
+                        | "wrapping_mul"
+                        | "wrapping_div"
+                        | "wrapping_rem"
+                        | "wrapping_pow"
+                        | "overflowing_add"
+                        | "overflowing_sub"
+                        | "overflowing_mul"
+                        | "overflowing_div"
+                        | "overflowing_rem"
+                        | "overflowing_pow"
+                );
+        }
+    }
+    false
 }
 
 /// Find `env.events().publish(...)` calls in the source and return their
@@ -965,6 +1069,52 @@ impl TokenInterface for TokenContract {
         );
     }
 
+    #[test]
+    fn marks_only_methods_that_call_require_auth() {
+        let src = r#"
+#[contractimpl]
+impl TokenContract {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        to.require_auth();
+    }
+    pub fn balance(env: Env, owner: Address) -> i128 {
+        0
+    }
+}
+"#;
+        let (methods, _) = find_methods(src);
+        assert_eq!(methods[0].name, "mint");
+        assert!(methods[0].requires_auth);
+        assert_eq!(methods[1].name, "balance");
+        assert!(!methods[1].requires_auth);
+    }
+
+    #[test]
+    fn marks_only_i128_methods_that_perform_arithmetic() {
+        let src = r#"
+#[contractimpl]
+impl Contract {
+    pub fn add(env: Env, amount: i128, fee: i128) -> i128 {
+        amount + fee
+    }
+    pub fn balance(env: Env, amount: i128) -> i128 {
+        amount
+    }
+    pub fn count(env: Env, left: u32, right: u32) -> u32 {
+        left + right
+    }
+    pub fn checked(env: Env, amount: i128, fee: i128) -> i128 {
+        amount.checked_add(fee).unwrap()
+    }
+}
+"#;
+        let (methods, _) = find_methods(src);
+        assert!(methods[0].has_i128_math);
+        assert!(!methods[1].has_i128_math);
+        assert!(!methods[2].has_i128_math);
+        assert!(methods[3].has_i128_math);
+    }
+
     // ── event detection tests ──
 
     #[test]
@@ -1091,6 +1241,8 @@ impl Contract {
             .map(|n| MethodInfo {
                 name: (*n).to_string(),
                 args: vec![],
+                requires_auth: false,
+                has_i128_math: false,
             })
             .collect()
     }
@@ -1125,6 +1277,8 @@ impl Contract {
         let found = detect_init_method(&[MethodInfo {
             name: "initialize".into(),
             args: vec![("admin".into(), "Address".into())],
+            requires_auth: false,
+            has_i128_math: false,
         }])
         .unwrap();
         assert_eq!(

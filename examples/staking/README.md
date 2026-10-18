@@ -16,6 +16,10 @@ both "stake token A, earn token B" and the classic single-token setup
 - `claim` — withdraw your proportional share of rewards (paid in the reward token)
 - `get_pending_reward` — preview rewards before claiming
 
+`distribute` requires a non-empty pool. When total stake is zero, it fails with
+`Error::NoStakers` (code 5) without moving tokens, updating rewards, or emitting
+a `distrib` event. The admin can retry after someone stakes.
+
 ## Develop
 
 ```sh
@@ -34,5 +38,5 @@ stellar contract deploy \
   --wasm target/wasm32v1-none/release/staking.wasm \
   --source-account <your-identity> \
   --network testnet \
-  -- --admin <ADMIN_ADDRESS> --stake-token <STAKE_TOKEN_ADDRESS> --reward-token <REWARD_TOKEN_ADDRESS>
+  -- --admin <ADMIN_ADDRESS> --stake_token <STAKE_TOKEN_ADDRESS> --reward_token <REWARD_TOKEN_ADDRESS>
 ```

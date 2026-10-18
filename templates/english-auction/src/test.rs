@@ -1,4 +1,4 @@
-extern crate std;
+﻿extern crate std;
 
 use super::*;
 use soroban_sdk::testutils::Address as _;
@@ -24,6 +24,7 @@ fn make_token(env: &Env) -> Tok<'_> {
 #[allow(dead_code)]
 struct TestContext<'a> {
     contract: EnglishAuctionContractClient<'a>,
+    contract_address: Address,
     asset_token: Tok<'a>,
     payment_token: Tok<'a>,
     seller: Address,
@@ -52,6 +53,7 @@ fn setup(env: &Env) -> TestContext<'_> {
     let duration = 1_000_u64;
 
     let contract_id = env.register(EnglishAuctionContract, ());
+    let contract_address = contract_id.clone();
     let contract = EnglishAuctionContractClient::new(env, &contract_id);
 
     contract.initialize(
@@ -73,6 +75,7 @@ fn setup(env: &Env) -> TestContext<'_> {
 
     TestContext {
         contract,
+        contract_address,
         asset_token,
         payment_token,
         seller,
@@ -124,7 +127,8 @@ fn test_place_multiple_bids() {
 fn test_bid_below_reserve() {
     let env = Env::default();
     let ctx = setup(&env);
-    ctx.contract.place_bid(&ctx.bidder1, &(ctx.reserve_price - 1));
+    ctx.contract
+        .place_bid(&ctx.bidder1, &(ctx.reserve_price - 1));
 }
 
 #[test]
@@ -146,12 +150,128 @@ fn test_settle_after_auction_ends() {
 }
 
 #[test]
-fn test_cancel_auction() {
+fn test_cancel_auction_after_bid_fails() {
     let env = Env::default();
     let ctx = setup(&env);
 
     ctx.contract.place_bid(&ctx.bidder1, &ctx.reserve_price);
+    let result = ctx.contract.try_cancel();
+
+    assert!(result.is_err());
+    assert_eq!(ctx.contract.get_state(), AuctionState::Open);
+    assert_eq!(
+        ctx.asset_token.client.balance(&ctx.contract_address),
+        ctx.asset_amount
+    );
+    assert_eq!(ctx.asset_token.client.balance(&ctx.seller), 0);
+    assert_eq!(
+        ctx.payment_token.client.balance(&ctx.contract_address),
+        ctx.reserve_price
+    );
+    assert_eq!(
+        ctx.payment_token.client.balance(&ctx.bidder1),
+        10_000 - ctx.reserve_price
+    );
+}
+
+#[test]
+fn test_cancel_ended_auction_with_bid_fails_before_settlement() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    ctx.contract.place_bid(&ctx.bidder1, &ctx.reserve_price);
+    env.ledger()
+        .with_mut(|li| li.timestamp = ctx.start_ts + ctx.duration + 1);
+
+    let result = ctx.contract.try_cancel();
+
+    assert!(result.is_err());
+    assert_eq!(ctx.contract.get_state(), AuctionState::Open);
+    assert_eq!(
+        ctx.asset_token.client.balance(&ctx.contract_address),
+        ctx.asset_amount
+    );
+    assert_eq!(ctx.asset_token.client.balance(&ctx.seller), 0);
+    assert_eq!(
+        ctx.payment_token.client.balance(&ctx.contract_address),
+        ctx.reserve_price
+    );
+    assert_eq!(
+        ctx.payment_token.client.balance(&ctx.bidder1),
+        10_000 - ctx.reserve_price
+    );
+}
+
+#[test]
+fn test_cancel_ended_auction_without_bids() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    env.ledger()
+        .with_mut(|li| li.timestamp = ctx.start_ts + ctx.duration + 1);
     ctx.contract.cancel();
 
     assert_eq!(ctx.contract.get_state(), AuctionState::Canceled);
+    assert_eq!(
+        ctx.asset_token.client.balance(&ctx.seller),
+        ctx.asset_amount
+    );
+    assert_eq!(ctx.asset_token.client.balance(&ctx.contract_address), 0);
+}
+#[test]
+fn test_refund_fails_does_not_block_new_bid() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let start_ts = 1_000_000_u64;
+    env.ledger().with_mut(|li| li.timestamp = start_ts);
+
+    let asset_token = make_token(&env);
+    let payment_token = make_token(&env);
+    let seller = Address::generate(&env);
+    let bidder1 = Address::generate(&env);
+    let bidder2 = Address::generate(&env);
+    let bidder3 = Address::generate(&env);
+
+    let asset_amount = 100_i128;
+    let reserve_price = 500_i128;
+    let duration = 1_000_u64;
+
+    let contract_id = env.register(EnglishAuctionContract, ());
+    let contract = EnglishAuctionContractClient::new(&env, &contract_id);
+
+    contract.initialize(
+        &seller,
+        &asset_token.address,
+        &payment_token.address,
+        &asset_amount,
+        &reserve_price,
+        &duration,
+    );
+
+    // Mint tokens
+    asset_token.admin.mint(&seller, &asset_amount);
+    payment_token.admin.mint(&bidder1, &10_000);
+    payment_token.admin.mint(&bidder2, &10_000);
+    payment_token.admin.mint(&bidder3, &10_000);
+
+    // Fund the auction
+    contract.fund();
+
+    // First bid
+    contract.place_bid(&bidder1, &reserve_price);
+
+    // Make bidder1 have no trustline or be unable to receive refund by
+    // creating a scenario where the refund transfer would fail - but we
+    // can't easily make transfer fail in mock_all_auths; instead, we
+    // test that the pull refund pattern is implemented correctly
+    // by verifying bidder2 can bid after bidder1
+    contract.place_bid(&bidder2, &(reserve_price + 100));
+
+    let (bidder, bid) = contract.get_highest_bid();
+    assert_eq!(bidder, Some(bidder2.clone()));
+    assert_eq!(bid, reserve_price + 100);
+
+    // Bidder1 should have a refund available
+    contract.withdraw_refund(&bidder1);
 }

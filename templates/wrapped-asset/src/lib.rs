@@ -28,6 +28,9 @@ pub struct WrappedAssetContract;
 impl WrappedAssetContract {
     /// Initialize the wrapper for a given underlying SEP-41 token.
     pub fn initialize(env: Env, underlying: Address) {
+        if env.storage().instance().has(&DataKey::Underlying) {
+            panic!("already initialized");
+        }
         env.storage().instance().set(&DataKey::Underlying, &underlying);
         env.storage().instance().set(&DataKey::TotalSupply, &0_i128);
     }

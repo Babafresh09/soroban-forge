@@ -11,6 +11,8 @@ Soroban contract project and it generates
 | `tests/forge_smoke.rs` | smoke test registering the detected `#[contract]` type and constructing its client |
 | `tests/forge_invariant.rs` | proptest-based invariant testing harness asserting state properties across random call sequences |
 | `tests/forge_init_once.rs` | (when an initialize-style entrypoint is detected) asserts a second call to it is rejected |
+| `tests/forge_auth.rs` | (when an entrypoint calls `require_auth()`) asserts a call without mocked authorization is rejected |
+| `tests/forge_overflow.rs` | (when an entrypoint performs arithmetic on an `i128` argument) exercises a large in-range value and asserts the call does not trap |
 | `tests/forge_budget.rs` | (with `--budget`) benchmark measuring one entrypoint's CPU instructions and memory via `env.cost_estimate().budget()`, asserting an upper bound |
 | `tests/forge_upgrade.rs` | (when an upgrade entrypoint is detected) writes state, upgrades the contract, and asserts the state survived |
 | `tests/forge_roundtrip.rs` | (when an entrypoint takes an `Option`, `Vec` or `Map`) passes empty, single- and multi-element values through it |
@@ -64,6 +66,18 @@ exposes an entrypoint named `initialize`, `initialise`, `init` or `setup`. It
 calls the entrypoint, then asserts `try_<entrypoint>` returns `Err` on a second
 call. A failure means the contract has no re-initialization guard — a real
 finding, not a flaky test.
+
+`tests/forge_auth.rs` also needs no flag. It is written when a detected
+entrypoint body calls `require_auth()`, and asserts the corresponding
+`try_<entrypoint>` call returns an error using an environment with no mocked
+authorization.
+
+`tests/forge_overflow.rs` needs no flag either. It is written when an entrypoint
+takes an `i128` argument, uses that argument in arithmetic, and calls the
+corresponding `try_<entrypoint>` with `i128::MAX / 2` for the first `i128`
+argument and `1_i128` for any others. It asserts the call succeeds; Cargo's test
+profile has overflow checks enabled, so arithmetic overflow traps fail the
+assertion.
 
 `tests/forge_storage_isolation.rs` needs no flag either. It is written when
 the contract uses 2 or more of instance/persistent/temporary storage, and

@@ -73,6 +73,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Reject staking reward distributions to an empty pool with `Error::NoStakers`, without emitting a misleading `distrib` event (#572).
+
 - Concurrent writes to `identities.json` and `networks.json` no longer lose
   each other: every read-modify-write of either store (`identity
   generate|import|use|fund|remove`, `network add|use|remove`) now runs under
@@ -202,6 +204,10 @@ forge_tests` inside `src/`
 
 ### Security
 
+- Every action in the GitHub presets is now pinned to a commit SHA with a
+  `# <version>` comment, including `release.yml`, which runs with
+  `contents: write`. A unit test walks the embedded presets and fails on any
+  `uses:` that names a tag or branch instead (#609)
 - `governance` template: `cast_vote` no longer takes a caller-supplied
   `weight`, which let one voter pass any proposal (or subtract votes with a
   negative weight). Each admin-registered member now has exactly one vote,

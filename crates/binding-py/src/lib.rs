@@ -937,6 +937,7 @@ impl ForgePlugin for BindingsPyPlugin {
 
     fn command(&self) -> Command {
         Command::new("bindings-py")
+            .visible_alias("bindings-python")
             .about("Generate a typed Python client package from the built contract wasm")
             .long_about(
                 "Generate client.py: a typed Python client, one method per entrypoint, from \
@@ -947,6 +948,12 @@ impl ForgePlugin for BindingsPyPlugin {
                  the same official way `spec`/`verify` do and renders Python source directly, \
                  with the generated client delegating all on-chain interaction to the official \
                  `stellar-sdk` package.",
+            )
+            .arg(
+                Arg::new("contract")
+                    .long("contract")
+                    .short('c')
+                    .help("Contract crate name in a multi-contract Cargo workspace"),
             )
             .arg(
                 Arg::new("package-name")
@@ -980,7 +987,11 @@ impl ForgePlugin for BindingsPyPlugin {
             .get_one::<String>("path")
             .map(|p| ctx.cwd.join(p))
             .unwrap_or_else(|| ctx.cwd.clone());
-        let wasm_override = matches.get_one::<String>("wasm").map(|p| ctx.cwd.join(p));
+        let contract = matches.get_one::<String>("contract").map(String::as_str);
+        let wasm_override = matches
+            .get_one::<String>("wasm")
+            .map(|p| ctx.cwd.join(p))
+            .or_else(|| contract.map(|c| locate_wasm(&dir, &c.replace('-', "_"))));
         let output = matches
             .get_one::<String>("output")
             .map(|p| ctx.cwd.join(p))
@@ -988,7 +999,8 @@ impl ForgePlugin for BindingsPyPlugin {
         let force = matches.get_flag("force");
         let package_name = matches
             .get_one::<String>("package-name")
-            .map(String::as_str);
+            .map(String::as_str)
+            .or(contract);
 
         let wasm_path =
             generate_bindings(&dir, wasm_override.as_deref(), &output, force, package_name)?;
