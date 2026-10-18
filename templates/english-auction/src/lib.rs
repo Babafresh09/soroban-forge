@@ -188,7 +188,7 @@ impl EnglishAuctionContract {
     }
     /// Cancel the auction and return the asset to the seller.
     ///
-    /// Can only be called by the seller before auction end.
+    /// Can only be called by the seller before any bids have been placed.
     pub fn cancel(env: Env) {
         let seller: Address = env.storage().instance().get(&DataKey::Seller).unwrap();
         let state: AuctionState = env.storage().instance().get(&DataKey::State).unwrap();
@@ -196,6 +196,11 @@ impl EnglishAuctionContract {
             panic!("auction is not open");
         }
         seller.require_auth();
+
+        if env.storage().instance().has(&DataKey::HighestBidder) {
+            panic!("cannot cancel auction after a bid has been placed");
+        }
+
         let asset_token: Address = env.storage().instance().get(&DataKey::AssetToken).unwrap();
         let asset_amount: i128 = env.storage().instance().get(&DataKey::AssetAmount).unwrap();
         token::Client::new(&env, &asset_token).transfer(
@@ -233,7 +238,7 @@ impl EnglishAuctionContract {
             .get(&DataKey::State)
             .unwrap_or(AuctionState::Pending)
     }
-}
+
     /// Withdraw any available refund for the caller.
     pub fn withdraw_refund(env: Env, bidder: Address) {
         bidder.require_auth();
