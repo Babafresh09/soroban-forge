@@ -309,9 +309,11 @@ pub const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// Result of probing one network's RPC endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reachability {
-    /// A TCP connection to the endpoint's host and port succeeded.
+    /// A TCP connection (or healthy Soroban RPC response) succeeded.
     Reachable { latency_ms: u64 },
-    /// The endpoint could not be reached; the string says why.
+    /// The endpoint answered `getNetwork` with a different passphrase than configured.
+    PassphraseMismatch { expected: String, actual: String },
+    /// The endpoint could not be reached or reported unhealthy status; the string says why.
     Unreachable(String),
 }
 
@@ -324,6 +326,9 @@ impl Reachability {
     pub fn label(&self) -> String {
         match self {
             Reachability::Reachable { latency_ms } => format!("[reachable, {latency_ms}ms]"),
+            Reachability::PassphraseMismatch { expected, actual } => {
+                format!("[passphrase mismatch: expected \"{expected}\", got \"{actual}\"]")
+            }
             Reachability::Unreachable(reason) => format!("[unreachable: {reason}]"),
         }
     }
@@ -334,6 +339,13 @@ impl Reachability {
             Reachability::Reachable { latency_ms } => serde_json::json!({
                 "reachable": true,
                 "latency_ms": latency_ms,
+            }),
+            Reachability::PassphraseMismatch { expected, actual } => serde_json::json!({
+                "reachable": false,
+                "passphrase_mismatch": true,
+                "expected_passphrase": expected,
+                "actual_passphrase": actual,
+                "error": format!("passphrase mismatch: expected `{expected}`, got `{actual}`"),
             }),
             Reachability::Unreachable(reason) => serde_json::json!({
                 "reachable": false,
@@ -381,11 +393,34 @@ pub fn endpoint_host_port(url: &str) -> std::result::Result<(String, u16), Strin
     Ok((host.to_string(), port))
 }
 
-/// Lightweight reachability probe: resolve the endpoint and open (then
-/// immediately drop) a TCP connection, bounded by `timeout`.  No RPC request
-/// is sent, so it is cheap and side-effect free; it answers "can this machine
-/// reach the endpoint right now", which is what `list --check` reports.
+fn endpoint_path(url: &str) -> &str {
+    if let Some((_, rest)) = url.split_once("://") {
+        if let Some(idx) = rest.find('/') {
+            let path = &rest[idx..];
+            let path = path.split('#').next().unwrap_or(path);
+            if !path.is_empty() {
+                return path;
+            }
+        }
+    }
+    "/"
+}
+
+/// Lightweight reachability probe: resolve the endpoint and open a TCP
+/// connection, bounded by `timeout`.
 pub fn probe_endpoint(url: &str, timeout: Duration) -> Reachability {
+    probe_rpc_endpoint(url, None, timeout)
+}
+
+/// Probe a Soroban RPC endpoint over HTTP JSON-RPC (`getHealth` / `getNetwork`)
+/// and check health and optional network passphrase.
+pub fn probe_rpc_endpoint(
+    url: &str,
+    expected_passphrase: Option<&str>,
+    timeout: Duration,
+) -> Reachability {
+    use std::io::{Read, Write};
+
     let (host, port) = match endpoint_host_port(url) {
         Ok(hp) => hp,
         Err(reason) => return Reachability::Unreachable(reason),
@@ -401,27 +436,123 @@ pub fn probe_endpoint(url: &str, timeout: Duration) -> Reachability {
     }
 
     let mut last_error = None;
+    let mut connected_stream = None;
     for addr in addrs {
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             break;
         }
         match TcpStream::connect_timeout(&addr, remaining) {
-            Ok(_) => {
-                return Reachability::Reachable {
-                    latency_ms: started.elapsed().as_millis() as u64,
-                }
+            Ok(stream) => {
+                connected_stream = Some(stream);
+                break;
             }
             Err(e) => last_error = Some(e),
         }
     }
-    Reachability::Unreachable(match last_error {
-        Some(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            format!("timed out after {}s", timeout.as_secs_f64())
+
+    let Some(mut stream) = connected_stream else {
+        return Reachability::Unreachable(match last_error {
+            Some(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                format!("timed out after {}s", timeout.as_secs_f64())
+            }
+            Some(e) => e.to_string(),
+            None => format!("timed out after {}s", timeout.as_secs_f64()),
+        });
+    };
+
+    let connect_latency_ms = started.elapsed().as_millis() as u64;
+    let scheme = url.split_once("://").map(|(s, _)| s).unwrap_or("");
+    if !scheme.eq_ignore_ascii_case("http") {
+        return Reachability::Reachable {
+            latency_ms: connect_latency_ms,
+        };
+    }
+
+    let io_timeout = timeout
+        .saturating_sub(started.elapsed())
+        .min(Duration::from_millis(200));
+    if io_timeout.is_zero() {
+        return Reachability::Reachable {
+            latency_ms: connect_latency_ms,
+        };
+    }
+    let _ = stream.set_write_timeout(Some(io_timeout));
+    let _ = stream.set_read_timeout(Some(io_timeout));
+
+    let path = endpoint_path(url);
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getHealth"}"#;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    if stream.write_all(request.as_bytes()).is_err() {
+        return Reachability::Reachable {
+            latency_ms: connect_latency_ms,
+        };
+    }
+
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    if response.is_empty() {
+        return Reachability::Reachable {
+            latency_ms: connect_latency_ms,
+        };
+    }
+
+    let Some((headers, json_body)) = response.split_once("\r\n\r\n") else {
+        return Reachability::Reachable {
+            latency_ms: started.elapsed().as_millis() as u64,
+        };
+    };
+
+    let status_line = headers.lines().next().unwrap_or("");
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok());
+    if let Some(code) = status_code {
+        if !(200..300).contains(&code) {
+            return Reachability::Unreachable(format!("HTTP {code}"));
         }
-        Some(e) => e.to_string(),
-        None => format!("timed out after {}s", timeout.as_secs_f64()),
-    })
+    }
+
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_body.trim()) {
+        if let Some(err) = val
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Reachability::Unreachable(format!("RPC error: {err}"));
+        }
+        if let Some(status) = val
+            .get("result")
+            .and_then(|r| r.get("status"))
+            .and_then(|s| s.as_str())
+        {
+            if status != "healthy" {
+                return Reachability::Unreachable(format!("unhealthy RPC status: {status}"));
+            }
+        }
+        if let (Some(expected), Some(actual)) = (
+            expected_passphrase,
+            val.get("result")
+                .and_then(|r| r.get("passphrase"))
+                .and_then(|p| p.as_str()),
+        ) {
+            if actual != expected {
+                return Reachability::PassphraseMismatch {
+                    expected: expected.to_string(),
+                    actual: actual.to_string(),
+                };
+            }
+        }
+    }
+
+    Reachability::Reachable {
+        latency_ms: started.elapsed().as_millis() as u64,
+    }
 }
 
 /// Probe every listed network concurrently, so one slow endpoint does not
@@ -1622,5 +1753,81 @@ mod tests {
             .try_get_matches_from(["network", "list"])
             .unwrap();
         assert!(!plain.subcommand().unwrap().1.get_flag("check"));
+    }
+
+    fn spawn_stub_rpc_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (std::thread::JoinHandle<()>, String) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/soroban/rpc");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (handle, url)
+    }
+
+    #[test]
+    fn stub_server_healthy_unhealthy_and_wrong_network_responses() {
+        // 1. Healthy response
+        let (srv_healthy, url_healthy) = spawn_stub_rpc_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","passphrase":"Test SDF Network ; September 2015"}}"#,
+        );
+        let res_healthy = probe_rpc_endpoint(
+            &url_healthy,
+            Some("Test SDF Network ; September 2015"),
+            Duration::from_secs(2),
+        );
+        srv_healthy.join().unwrap();
+        assert!(res_healthy.is_reachable(), "{res_healthy:?}");
+
+        // 2. Unhealthy response
+        let (srv_unhealthy, url_unhealthy) = spawn_stub_rpc_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"unhealthy"}}"#,
+        );
+        let res_unhealthy = probe_rpc_endpoint(
+            &url_unhealthy,
+            Some("Test SDF Network ; September 2015"),
+            Duration::from_secs(2),
+        );
+        srv_unhealthy.join().unwrap();
+        assert!(!res_unhealthy.is_reachable(), "{res_unhealthy:?}");
+        assert!(
+            res_unhealthy.label().contains("unhealthy"),
+            "{}",
+            res_unhealthy.label()
+        );
+
+        // 3. Wrong-network response
+        let (srv_wrong_net, url_wrong_net) = spawn_stub_rpc_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","passphrase":"Public Global Stellar Network ; September 2015"}}"#,
+        );
+        let res_wrong_net = probe_rpc_endpoint(
+            &url_wrong_net,
+            Some("Test SDF Network ; September 2015"),
+            Duration::from_secs(2),
+        );
+        srv_wrong_net.join().unwrap();
+        assert_eq!(
+            res_wrong_net,
+            Reachability::PassphraseMismatch {
+                expected: "Test SDF Network ; September 2015".into(),
+                actual: "Public Global Stellar Network ; September 2015".into(),
+            }
+        );
     }
 }
