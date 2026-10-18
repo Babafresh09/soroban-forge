@@ -2,7 +2,8 @@ description = "binary outcome market with oracle resolution and parimutuel payou
 
 [post_generate]
 hints = [
-  "deploy args: --oracle <ADDRESS> --token <ADDRESS>",
+  "deploy args: --oracle <ADDRESS> --token <ADDRESS> --close_time <UNIX_SECONDS>",
+  "close_time is the ledger timestamp (seconds) from which staking is closed and resolve() opens; it must be in the future and is fixed at construction",
   "only the oracle address can call resolve() — pick it before deploying, it is fixed at construction",
   "outcomes are booleans: true = YES, false = NO",
 ]
